@@ -1,7 +1,6 @@
 import pytest
 import torch
 
-from losses import BCEDiceLoss
 from models.transunet import MultiHeadAttention, TransUNet, ViT
 
 
@@ -23,25 +22,15 @@ def test_transunet_preserves_spatial_shape(channels: int) -> None:
     assert model(torch.randn(2, channels, 64, 64)).shape == (2, 1, 64, 64)
 
 
-def test_bce_dice_loss_is_finite_and_prefers_correct_logits() -> None:
+def test_bce_with_logits_loss_is_finite_and_prefers_correct_logits() -> None:
     target = torch.tensor([[[[1.0, 0.0]]]])
-    criterion = BCEDiceLoss()
+    criterion = torch.nn.BCEWithLogitsLoss()
 
     correct = criterion(torch.tensor([[[[8.0, -8.0]]]]), target)
     wrong = criterion(torch.tensor([[[[-8.0, 8.0]]]]), target)
 
     assert torch.isfinite(correct)
     assert correct < wrong
-
-
-def test_bce_dice_loss_exposes_components_that_sum_to_total() -> None:
-    logits = torch.tensor([[[[1.0, -1.0]]]])
-    target = torch.tensor([[[[1.0, 0.0]]]])
-    criterion = BCEDiceLoss()
-
-    bce_loss, dice_loss = criterion.components(logits, target)
-
-    assert torch.allclose(criterion(logits, target), bce_loss + dice_loss)
 
 
 def test_attention_uses_fp32_inside_autocast_to_avoid_qk_overflow() -> None:

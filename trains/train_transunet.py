@@ -77,7 +77,7 @@ CFG: dict[str, Any] = {
     "LR_MIN": 1e-6,
     "WEIGHT_DECAY": 2e-4,
     # Multiplier for target=1 pixels in BCE. Tune jointly with threshold.
-    "BCE_POS_WEIGHT": 1.0,
+    "BCE_POS_WEIGHT": 1.2,
     # Total loss = BCEWithLogitsLoss + DICE_LOSS_WEIGHT * weighted Dice loss.
     "DICE_LOSS_WEIGHT": 1.0,
     "DICE_BACKGROUND_WEIGHT": 1.0,
@@ -186,17 +186,36 @@ def build_loss(cfg: dict[str, Any], device: torch.device) -> BCEWeightedDiceLoss
 def _summarize_predictions(
     records: list[SlicePrediction], compute_volume_metrics: bool = True
 ) -> dict[str, float]:
+    """Aggregate slice metrics without letting one FP collapse a whole slice."""
+    if not records:
+        raise ValueError("cannot summarize an empty prediction collection")
     slice_rows = [
         binary_slice_metrics(record.prediction, record.target) for record in records
     ]
+    true_positive = sum(
+        int(np.logical_and(record.prediction, record.target).sum())
+        for record in records
+    )
+    false_positive = sum(
+        int(np.logical_and(record.prediction, ~record.target).sum())
+        for record in records
+    )
+    false_negative = sum(
+        int(np.logical_and(~record.prediction, record.target).sum())
+        for record in records
+    )
+    micro_denominator = 2 * true_positive + false_positive + false_negative
+    negative_records = [record for record in records if not record.target.any()]
     summary = {
-        "dice_2d": finite_mean([float(row["dice"]) for row in slice_rows]),
+        "dice_micro": (
+            1.0 if micro_denominator == 0 else 2.0 * true_positive / micro_denominator
+        ),
         "iou_2d": finite_mean([float(row["iou"]) for row in slice_rows]),
         "recall_2d": finite_mean([float(row["recall"]) for row in slice_rows]),
         "precision_2d": finite_mean([float(row["precision"]) for row in slice_rows]),
         "fp_2d": finite_mean([float(row["fp"]) for row in slice_rows]),
         "fn_2d": finite_mean([float(row["fn"]) for row in slice_rows]),
-        # Unlike dice_2d, this excludes background-only targets. It is the
+        # Unlike dice_micro, this excludes background-only targets. It is the
         # useful score for knowing whether the model actually segments tumors.
         "dice_tumor": finite_mean(
             [
@@ -204,6 +223,12 @@ def _summarize_predictions(
                 for record, row in zip(records, slice_rows, strict=True)
                 if record.target.any()
             ]
+        ),
+        "negative_slice_specificity": (
+            float(sum(not record.prediction.any() for record in negative_records))
+            / len(negative_records)
+            if negative_records
+            else float("nan")
         ),
     }
     if not compute_volume_metrics:
@@ -277,24 +302,24 @@ def run_epoch(
         total_bce_loss += float(bce_loss.detach()) * batch_size
         total_dice_loss += float(dice_loss.detach()) * batch_size
         total_images += batch_size
-        batch_slice_metrics = [
-            binary_slice_metrics(prediction, target)
-            for prediction, target in zip(predictions, targets, strict=True)
+        batch_records = [
+            SlicePrediction(str(case_id), int(slice_index), prediction, target)
+            for case_id, slice_index, prediction, target in zip(
+                case_ids, indices, predictions, targets, strict=True
+            )
         ]
+        batch_summary = _summarize_predictions(
+            batch_records, compute_volume_metrics=False
+        )
         step_values = {
             "loss": float(loss.detach()),
             "bce_loss": float(bce_loss.detach()),
             "dice_loss": float(dice_loss.detach()),
-            "dice": finite_mean(
-                [float(metric["dice"]) for metric in batch_slice_metrics]
-            ),
-            "dice_tumor": finite_mean(
-                [
-                    float(metric["dice"])
-                    for metric, target in zip(batch_slice_metrics, targets, strict=True)
-                    if target.any()
-                ]
-            ),
+            "dice_micro": batch_summary["dice_micro"],
+            "dice_tumor": batch_summary["dice_tumor"],
+            "negative_slice_specificity": batch_summary[
+                "negative_slice_specificity"
+            ],
         }
         iterator.set_postfix(
             loss=f"{step_values['loss']:.4f}",
@@ -337,8 +362,9 @@ def _wandb_step_logger(
         "loss",
         "bce_loss",
         "dice_loss",
-        "dice",
+        "dice_micro",
         "dice_tumor",
+        "negative_slice_specificity",
     ]
     wandb_run.define_metric(step_key)
     for metric_key in metric_keys:
@@ -502,13 +528,19 @@ def main() -> None:
                 "train_loss": train_metrics["loss"],
                 "train_bce_loss": train_metrics["bce_loss"],
                 "train_dice_loss": train_metrics["dice_loss"],
-                "train_dice": train_metrics["dice_2d"],
+                "train_dice_micro": train_metrics["dice_micro"],
                 "train_dice_tumor": train_metrics["dice_tumor"],
+                "train_negative_specificity": train_metrics[
+                    "negative_slice_specificity"
+                ],
                 "val_loss": val_metrics["loss"],
                 "val_bce_loss": val_metrics["bce_loss"],
                 "val_dice_loss": val_metrics["dice_loss"],
-                "val_dice": val_metrics["dice_2d"],
+                "val_dice_micro": val_metrics["dice_micro"],
                 "val_dice_tumor": val_metrics["dice_tumor"],
+                "val_negative_specificity": val_metrics[
+                    "negative_slice_specificity"
+                ],
             }
             print(log)
             if wandb_run is not None:

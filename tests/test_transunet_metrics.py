@@ -1,7 +1,7 @@
 import numpy as np
 import SimpleITK as sitk
 
-from inferences.infer_transunet import write_prediction_volume
+from inferences.infer_transunet import _slice_classification_metrics, write_prediction_volume
 from utils.metrics import binary_slice_metrics, binary_volume_metrics
 
 
@@ -37,6 +37,18 @@ def test_volume_metrics_uses_spacing_and_empty_surface_nan() -> None:
     assert equal["assd"] == 0.0
     assert np.isnan(empty["hd95"])
     assert np.isnan(empty["assd"])
+
+
+def test_slice_classification_fp_fn_are_counts_of_slices_not_pixels() -> None:
+    tumor = np.array([[True, False], [False, False]])
+
+    false_negative = _slice_classification_metrics(np.zeros_like(tumor), tumor)
+    false_positive = _slice_classification_metrics(tumor, np.zeros_like(tumor))
+
+    assert false_negative["slice_fn"] == 1
+    assert false_negative["slice_fp"] == 0
+    assert false_positive["slice_fp"] == 1
+    assert false_positive["slice_fn"] == 0
 
 
 def test_write_prediction_preserves_reference_geometry(tmp_path) -> None:

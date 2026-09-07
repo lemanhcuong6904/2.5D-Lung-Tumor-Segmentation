@@ -39,10 +39,10 @@ def build_train_transform() -> A.Compose:
     """Build paired spatial and intensity augmentation for multi-slice CT input."""
     return A.Compose(
         [
-            A.HorizontalFlip(p=0.5),
+            A.HorizontalFlip(p=0.3),
             A.Affine(
-                rotate=(-15, 15),
-                scale=(0.9, 1.1),
+                rotate=(-25, 25),
+                scale=(0.85, 1.15),
                 translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
                 interpolation=1,
                 mask_interpolation=0,
@@ -59,10 +59,10 @@ def build_train_transform() -> A.Compose:
                 fill_mask=0,
                 p=0.2,
             ),
-            A.RandomGamma(gamma_limit=(80, 120), p=0.3),
-            A.RandomBrightnessContrast(
-                brightness_limit=0.0, contrast_limit=(-0.15, 0.15), p=0.3
-            ),
+            # A.RandomGamma(gamma_limit=(80, 120), p=0.3),
+            # A.RandomBrightnessContrast(
+            #     brightness_limit=0.0, contrast_limit=(-0.15, 0.15), p=0.3
+            # ),
         ]
     )
 

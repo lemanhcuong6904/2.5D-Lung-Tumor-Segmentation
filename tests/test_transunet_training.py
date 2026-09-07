@@ -2,9 +2,13 @@ import pytest
 import torch
 import numpy as np
 
-from losses import BCEDiceLoss
 from models.transunet import TransUNet
-from trains.train_transunet import _summarize_predictions, restore_training_state, run_epoch
+from trains.train_transunet import (
+    _summarize_predictions,
+    build_weighted_bce_loss,
+    restore_training_state,
+    run_epoch,
+)
 from utils.metrics import SlicePrediction
 from utils.training import load_checkpoint, save_checkpoint, warmup_cosine_lambda
 
@@ -15,6 +19,18 @@ def test_warmup_cosine_reaches_base_then_decays_to_minimum() -> None:
     assert schedule(0) == pytest.approx(0.505)
     assert schedule(1) == pytest.approx(1.0)
     assert schedule(9) == pytest.approx(0.01)
+
+
+def test_weighted_bce_uses_configured_foreground_weight() -> None:
+    criterion = build_weighted_bce_loss({"BCE_POS_WEIGHT": 7.0}, torch.device("cpu"))
+    logits = torch.zeros(1, 1, 1, 2)
+    target = torch.tensor([[[[1.0, 0.0]]]])
+
+    expected = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits, target, pos_weight=torch.tensor(7.0)
+    )
+
+    assert torch.allclose(criterion(logits, target), expected)
 
 
 def test_checkpoint_round_trip(tmp_path) -> None:
@@ -37,7 +53,7 @@ def test_run_epoch_returns_requested_metrics() -> None:
     model = TransUNet(1, base_channels=8, embed_dim=64, transformer_depth=1, transformer_heads=4, mlp_ratio=2.0, dropout=0.0, img_dim=32, backbone_pretrained=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 
-    metrics = run_epoch(model, [batch], BCEDiceLoss(), torch.device("cpu"), optimizer, None, 0.5)
+    metrics = run_epoch(model, [batch], torch.nn.BCEWithLogitsLoss(), torch.device("cpu"), optimizer, None, 0.5)
 
     assert {"loss", "dice_2d", "dice_tumor", "dice_3d"} <= metrics.keys()
     assert torch.isfinite(torch.tensor(metrics["loss"]))
@@ -53,11 +69,11 @@ def test_run_epoch_emits_per_batch_loss_components_to_step_logger() -> None:
     events: list[dict[str, float]] = []
     model = TransUNet(1, base_channels=8, embed_dim=64, transformer_depth=1, transformer_heads=4, mlp_ratio=2.0, dropout=0.0, img_dim=32, backbone_pretrained=False)
 
-    run_epoch(model, [batch], BCEDiceLoss(), torch.device("cpu"), None, None, 0.5, step_logger=events.append)
+    run_epoch(model, [batch], torch.nn.BCEWithLogitsLoss(), torch.device("cpu"), None, None, 0.5, step_logger=events.append)
 
     assert len(events) == 1
     assert {
-        "loss", "bce_loss", "dice_loss", "dice", "dice_tumor",
+        "loss", "bce_loss", "dice", "dice_tumor",
     } <= events[0].keys()
 
 
@@ -70,7 +86,7 @@ def test_run_epoch_skips_3d_reconstruction_for_repeated_sampled_slices() -> None
     }
     model = TransUNet(1, base_channels=8, embed_dim=64, transformer_depth=1, transformer_heads=4, mlp_ratio=2.0, dropout=0.0, img_dim=32, backbone_pretrained=False)
 
-    metrics = run_epoch(model, [batch], BCEDiceLoss(), torch.device("cpu"), None, None, 0.5, compute_volume_metrics=False)
+    metrics = run_epoch(model, [batch], torch.nn.BCEWithLogitsLoss(), torch.device("cpu"), None, None, 0.5, compute_volume_metrics=False)
 
     assert np.isnan(metrics["dice_3d"])
 

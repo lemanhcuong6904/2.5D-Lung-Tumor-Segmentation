@@ -74,12 +74,33 @@ def _foreground_diagnostics(case_rows: list[dict[str, Any]]) -> dict[str, float]
     }
 
 
-def run_inference(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, float]]:
+def _slice_classification_metrics(
+    prediction: np.ndarray, target: np.ndarray
+) -> dict[str, int]:
+    """Classify each slice by whether it contains any tumor pixel.
+
+    Dice/IoU/etc. remain pixel-wise segmentation metrics.  In contrast,
+    ``slice_fp`` and ``slice_fn`` are binary, per-slice classification errors
+    and can therefore be summed into integral counts over a split.
+    """
+    pred_has_tumor = bool(np.any(prediction))
+    target_has_tumor = bool(np.any(target))
+    return {
+        "pred_has_tumor": int(pred_has_tumor),
+        "target_has_tumor": int(target_has_tumor),
+        "slice_tp": int(pred_has_tumor and target_has_tumor),
+        "slice_tn": int(not pred_has_tumor and not target_has_tumor),
+        "slice_fp": int(pred_has_tumor and not target_has_tumor),
+        "slice_fn": int(not pred_has_tumor and target_has_tumor),
+    }
+
+
+def run_inference(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, float | int]]:
     """Run one checkpoint over a split, save volumes, and return case/report summaries."""
     device = torch.device(str(cfg["DEVICE"]))
     checkpoint_path = Path(str(cfg["CHECKPOINT_PATH"]).strip())
     if not str(cfg["CHECKPOINT_PATH"]).strip():
-        raise ValueError("Set CFG['CHECKPOINT_PATH'] to a checkpoint trained with the notebook TransUNet.")
+        raise ValueError("Set CFG['CHECKPOINT_PATH'] to a checkpoint trained with the current TransUNet architecture.")
     checkpoint = load_checkpoint(checkpoint_path, device)
     model_config = dict(checkpoint["model_config"])
     if int(model_config["in_channels"]) != int(cfg["NUM_SLICES"]):
@@ -109,7 +130,18 @@ def run_inference(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, 
                 seen_cases.add(case_id)
                 record = SlicePrediction(case_id, int(slice_index), prediction, target)
                 records.append(record)
-                slice_rows.append({"case_id": case_id, "slice_index": int(slice_index)} | binary_slice_metrics(prediction, target))
+                pixel_metrics = binary_slice_metrics(prediction, target)
+                # Do not expose pixel-level FP/FN here: reported FP/FN are
+                # defined by the requested per-slice tumor-presence task.
+                slice_rows.append(
+                    {"case_id": case_id, "slice_index": int(slice_index)}
+                    | {
+                        key: value
+                        for key, value in pixel_metrics.items()
+                        if key not in {"fp", "fn"}
+                    }
+                    | _slice_classification_metrics(prediction, target)
+                )
             progress.set_postfix(cases=f"{len(seen_cases)}/{len(case_ids)}")
     output_dir = Path(cfg["OUTPUT_DIR"])
     volumes = aggregate_case_predictions(records)
@@ -134,14 +166,16 @@ def run_inference(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, 
             }
             | metrics
         )
-    summary: dict[str, float] = {}
+    summary: dict[str, float | int] = {}
     for key in ("dice", "iou", "hd95", "assd"):
         values = [float(row[key]) for row in case_rows]
-        summary[key] = finite_mean(values)
+        summary[f"{key}_3d"] = finite_mean(values)
         if key in {"hd95", "assd"}:
             summary[f"{key}_valid_cases"] = float(sum(np.isfinite(values)))
-    for key in ("dice", "iou", "recall", "precision", "fp", "fn"):
+    for key in ("dice", "iou", "recall", "precision"):
         summary[f"{key}_2d"] = finite_mean([float(row[key]) for row in slice_rows])
+    summary["fp_2d"] = sum(int(row["slice_fp"]) for row in slice_rows)
+    summary["fn_2d"] = sum(int(row["slice_fn"]) for row in slice_rows)
     summary.update(_foreground_diagnostics(case_rows))
     summary["threshold"] = float(cfg["THRESHOLD"])
     _write_csv(output_dir / "per_case_metrics.csv", case_rows)
