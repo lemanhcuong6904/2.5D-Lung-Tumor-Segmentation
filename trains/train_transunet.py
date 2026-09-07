@@ -66,20 +66,17 @@ CFG: dict[str, Any] = {
     "BATCH_VAL": 16,
     "HARD_NEGATIVE_RADIUS": 3,
     "BALANCED_TRAIN_SAMPLING": True,
-    "POSITIVE_FRACTION": 0.4,
-    "HARD_NEGATIVE_FRACTION": 0.2,
-    "EASY_NEGATIVE_FRACTION": 0.4,
+    "POSITIVE_FRACTION": 0.25,
+    "HARD_NEGATIVE_FRACTION": 0.25,
+    "EASY_NEGATIVE_FRACTION": 0.5,
     "TRAIN_BATCHES_PER_EPOCH": 1000,
     "SAMPLER_SEED": 42,
     "NUM_WORKERS": 0,
     "PIN_MEMORY": True,
     "EPOCHS": 20,
-    "LR": 1e-4,
+    "LR": 2e-4,
     "LR_MIN": 1e-6,
     "WEIGHT_DECAY": 1e-4,
-    # Positive pixels receive this multiplier in BCE. Tune from 5--20 before
-    # using a much larger ratio derived from raw pixel imbalance.
-    "BCE_POS_WEIGHT": 10.0,
     "AMP": True,
     "THRESHOLD": 0.5,
     "EARLY_STOPPING_PATIENCE": 5,
@@ -367,7 +364,7 @@ def main() -> None:
     )
     model_config = _model_config(cfg)
     model = TransUNet(**model_config).to(device)
-    criterion = BCEDiceLoss(bce_pos_weight=float(cfg["BCE_POS_WEIGHT"]))
+    criterion = BCEDiceLoss()
     optimizer = AdamW(
         model.parameters(), lr=float(cfg["LR"]), weight_decay=float(cfg["WEIGHT_DECAY"])
     )

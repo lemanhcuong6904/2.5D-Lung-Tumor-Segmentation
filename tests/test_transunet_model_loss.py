@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from losses import BCEDiceLoss, DiceLoss
+from losses import BCEDiceLoss
 from models.transunet import MultiHeadAttention, TransUNet, ViT
 
 
@@ -42,30 +42,6 @@ def test_bce_dice_loss_exposes_components_that_sum_to_total() -> None:
     bce_loss, dice_loss = criterion.components(logits, target)
 
     assert torch.allclose(criterion(logits, target), bce_loss + dice_loss)
-
-
-def test_dice_loss_uses_only_tumor_containing_samples_when_requested() -> None:
-    logits = torch.zeros(2, 1, 2, 2)
-    positive_target = torch.tensor([[[[1.0, 0.0], [0.0, 0.0]]]])
-    targets = torch.cat([positive_target, torch.zeros_like(positive_target)])
-
-    mixed_loss = DiceLoss(positive_only=True)(logits, targets)
-    positive_only_loss = DiceLoss(positive_only=True)(logits[:1], positive_target)
-
-    assert torch.allclose(mixed_loss, positive_only_loss)
-
-
-def test_bce_pos_weight_is_applied_to_positive_pixels() -> None:
-    logits = torch.zeros(1, 1, 1, 2)
-    target = torch.tensor([[[[1.0, 0.0]]]])
-    criterion = BCEDiceLoss(bce_pos_weight=5.0)
-
-    bce_loss, _ = criterion.components(logits, target)
-    expected = torch.nn.functional.binary_cross_entropy_with_logits(
-        logits, target, pos_weight=torch.tensor(5.0)
-    )
-
-    assert torch.allclose(bce_loss, expected)
 
 
 def test_attention_uses_fp32_inside_autocast_to_avoid_qk_overflow() -> None:

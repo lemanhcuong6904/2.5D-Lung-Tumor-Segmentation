@@ -31,7 +31,6 @@
   "LR": 0.0001,
   "LR_MIN": 1e-06,
   "WEIGHT_DECAY": 0.0001,
-  "BCE_POS_WEIGHT": 10.0,
   "AMP": true,
   "THRESHOLD": 0.5,
   "EARLY_STOPPING_PATIENCE": 5,
