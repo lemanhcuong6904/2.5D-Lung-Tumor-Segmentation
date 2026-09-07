@@ -1,0 +1,41 @@
+# Python bytecode and tooling
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Python environments and local secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# IDE and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Training and experiment artefacts
+wandb/
+experiments/**/*.pt
+experiments/**/*.pth
+experiments/**/*.ckpt
+output/
+runs/
+logs/
+
+# Large local datasets (keep split/config files under data/config tracked)
+data/raw/
+data/processed/
+data/nifti/
+
+# Model exports and temporary files
+*.onnx
+*.tmp
+*.temp

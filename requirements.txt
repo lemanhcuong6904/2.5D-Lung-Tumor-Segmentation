@@ -1,0 +1,12 @@
+numpy
+pydicom
+SimpleITK
+Pillow
+pytest
+torch
+torchvision
+albumentations
+scipy
+wandb
+tqdm
+platformdirs
