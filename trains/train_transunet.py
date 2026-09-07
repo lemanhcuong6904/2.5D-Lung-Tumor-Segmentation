@@ -28,7 +28,6 @@ from data.transunet_dataset import (
     build_train_transform,
     read_case_ids,
 )
-from losses import BCEDiceLoss
 from models.transunet import TransUNet
 from utils.metrics import (
     SlicePrediction,
@@ -45,7 +44,7 @@ from utils.training import (
 )
 
 CFG: dict[str, Any] = {
-    "EXP_NAME": "transunet_2d",
+    "EXP_NAME": "transunet_2d_BCE_Dice",
     "PROCESSED_ROOT": str(ROOT_DIR / "data" / "processed"),
     "NIFTI_ROOT": str(ROOT_DIR / "data" / "nifti"),
     "TRAIN_SPLIT": str(ROOT_DIR / "data" / "config" / "train.txt"),
@@ -55,28 +54,35 @@ CFG: dict[str, Any] = {
     "IMAGE_SIZE": 256,
     "PATCH_DIM": 16,
     "BASE_CHANNELS": 128,
-    "EMBED_DIM": 1024,
+    "EMBED_DIM": 512,  #
     "TRANSFORMER_DEPTH": 8,
     "TRANSFORMER_HEADS": 4,
     "MLP_DIM": 512,
-    "MLP_RATIO": 0.5,
-    "DROPOUT": 0.1,
-    "BACKBONE_PRETRAINED": True,
+    "MLP_RATIO": 0.5,   #
+    "DROPOUT": 0.05,
+    "BACKBONE_PRETRAINED": True,    #
     "BATCH_TRAIN": 16,
     "BATCH_VAL": 16,
-    "HARD_NEGATIVE_RADIUS": 3,
+    "HARD_NEGATIVE_RADIUS": 4,
     "BALANCED_TRAIN_SAMPLING": True,
-    "POSITIVE_FRACTION": 0.25,
-    "HARD_NEGATIVE_FRACTION": 0.25,
-    "EASY_NEGATIVE_FRACTION": 0.5,
-    "TRAIN_BATCHES_PER_EPOCH": 1000,
+    "POSITIVE_FRACTION": 0.4,
+    "HARD_NEGATIVE_FRACTION": 0.2,
+    "EASY_NEGATIVE_FRACTION": 0.4,
+    "TRAIN_BATCHES_PER_EPOCH": 800,
     "SAMPLER_SEED": 42,
     "NUM_WORKERS": 0,
     "PIN_MEMORY": True,
     "EPOCHS": 20,
     "LR": 2e-4,
     "LR_MIN": 1e-6,
-    "WEIGHT_DECAY": 1e-4,
+    "WEIGHT_DECAY": 2e-4,
+    # Multiplier for target=1 pixels in BCE. Tune jointly with threshold.
+    "BCE_POS_WEIGHT": 1.0,
+    # Total loss = BCEWithLogitsLoss + DICE_LOSS_WEIGHT * weighted Dice loss.
+    "DICE_LOSS_WEIGHT": 1.0,
+    "DICE_BACKGROUND_WEIGHT": 1.0,
+    "DICE_FOREGROUND_WEIGHT": 1.2,
+    "DICE_SMOOTH": 1e-6,
     "AMP": True,
     "THRESHOLD": 0.5,
     "EARLY_STOPPING_PATIENCE": 5,
@@ -102,6 +108,79 @@ def _model_config(cfg: dict[str, Any]) -> dict[str, Any]:
         "backbone_pretrained": bool(cfg["BACKBONE_PRETRAINED"]),
         "mlp_dim": int(cfg["MLP_DIM"]),
     }
+
+
+class BCEWeightedDiceLoss(torch.nn.Module):
+    """Weighted BCE plus a soft Dice loss over background and tumor classes."""
+
+    def __init__(
+        self,
+        pos_weight: float,
+        dice_weight: float,
+        background_weight: float,
+        foreground_weight: float,
+        smooth: float,
+        device: torch.device,
+    ) -> None:
+        super().__init__()
+        if pos_weight <= 0:
+            raise ValueError("BCE_POS_WEIGHT must be positive")
+        if dice_weight < 0:
+            raise ValueError("DICE_LOSS_WEIGHT must be non-negative")
+        if background_weight <= 0 or foreground_weight <= 0:
+            raise ValueError("Dice class weights must be positive")
+        if smooth <= 0:
+            raise ValueError("DICE_SMOOTH must be positive")
+        self.bce = torch.nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor(pos_weight, device=device)
+        )
+        self.dice_weight = dice_weight
+        self.smooth = smooth
+        self.register_buffer(
+            "dice_class_weights",
+            torch.tensor([background_weight, foreground_weight], device=device),
+        )
+
+    def forward(
+        self, logits: torch.Tensor, targets: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bce_loss = self.bce(logits, targets)
+        targets = targets.float()
+        foreground_probabilities = logits.sigmoid()
+        probabilities = torch.cat(
+            (1.0 - foreground_probabilities, foreground_probabilities), dim=1
+        )
+        class_targets = torch.cat((1.0 - targets, targets), dim=1)
+        reduce_dims = tuple(range(2, probabilities.ndim))
+        intersection = (probabilities * class_targets).sum(dim=reduce_dims)
+        denominator = probabilities.sum(dim=reduce_dims) + class_targets.sum(
+            dim=reduce_dims
+        )
+        class_dice = (2.0 * intersection + self.smooth) / (
+            denominator + self.smooth
+        )
+        # Do not score a class absent from a particular target. Background is
+        # still scored on all ordinary slices and penalizes false positives.
+        valid_classes = class_targets.sum(dim=reduce_dims) > 0
+        weights = self.dice_class_weights.to(dtype=class_dice.dtype)
+        weighted_dice = (class_dice * valid_classes * weights).sum(dim=1) / (
+            (valid_classes * weights).sum(dim=1).clamp_min(torch.finfo(class_dice.dtype).eps)
+        )
+        dice_loss = 1.0 - weighted_dice.mean()
+        total_loss = bce_loss + self.dice_weight * dice_loss
+        return total_loss, bce_loss, dice_loss
+
+
+def build_loss(cfg: dict[str, Any], device: torch.device) -> BCEWeightedDiceLoss:
+    """Build the configured BCE + class-weighted Dice objective."""
+    return BCEWeightedDiceLoss(
+        pos_weight=float(cfg["BCE_POS_WEIGHT"]),
+        dice_weight=float(cfg["DICE_LOSS_WEIGHT"]),
+        background_weight=float(cfg["DICE_BACKGROUND_WEIGHT"]),
+        foreground_weight=float(cfg["DICE_FOREGROUND_WEIGHT"]),
+        smooth=float(cfg["DICE_SMOOTH"]),
+        device=device,
+    )
 
 
 def _summarize_predictions(
@@ -174,12 +253,7 @@ def run_epoch(
             device_type=device.type, enabled=use_amp
         ):
             logits = model(images)
-            if not isinstance(criterion, BCEDiceLoss):
-                raise TypeError(
-                    "run_epoch requires BCEDiceLoss to report BCE and Dice components"
-                )
-            bce_loss, dice_loss = criterion.components(logits, masks)
-            loss = bce_loss + dice_loss
+            loss, bce_loss, dice_loss = criterion(logits, masks)
         if training:
             if scaler is None:
                 loss.backward()
@@ -211,7 +285,9 @@ def run_epoch(
             "loss": float(loss.detach()),
             "bce_loss": float(bce_loss.detach()),
             "dice_loss": float(dice_loss.detach()),
-            "dice": finite_mean([float(metric["dice"]) for metric in batch_slice_metrics]),
+            "dice": finite_mean(
+                [float(metric["dice"]) for metric in batch_slice_metrics]
+            ),
             "dice_tumor": finite_mean(
                 [
                     float(metric["dice"])
@@ -223,7 +299,7 @@ def run_epoch(
         iterator.set_postfix(
             loss=f"{step_values['loss']:.4f}",
             bce=f"{step_values['bce_loss']:.4f}",
-            dloss=f"{step_values['dice_loss']:.4f}",
+            dice_loss=f"{step_values['dice_loss']:.4f}",
         )
         if step_logger is not None:
             step_logger(step_values)
@@ -258,7 +334,11 @@ def _wandb_step_logger(
         return None
     step_key = f"{split}_step"
     metric_keys = [
-        "loss", "bce_loss", "dice_loss", "dice", "dice_tumor",
+        "loss",
+        "bce_loss",
+        "dice_loss",
+        "dice",
+        "dice_tumor",
     ]
     wandb_run.define_metric(step_key)
     for metric_key in metric_keys:
@@ -291,7 +371,7 @@ def restore_training_state(
         "model_state",
         "optimizer_state",
         "scheduler_state",
-        "best_val_dice_tumor",
+        "best_val_loss",
     }
     missing = sorted(required - checkpoint.keys())
     if missing:
@@ -303,7 +383,7 @@ def restore_training_state(
         scaler.load_state_dict(checkpoint["scaler_state"])
     return (
         int(checkpoint["epoch"]) + 1,
-        float(checkpoint["best_val_dice_tumor"]),
+        float(checkpoint["best_val_loss"]),
         int(checkpoint.get("stale_epochs", 0)),
     )
 
@@ -364,7 +444,7 @@ def main() -> None:
     )
     model_config = _model_config(cfg)
     model = TransUNet(**model_config).to(device)
-    criterion = BCEDiceLoss()
+    criterion = build_loss(cfg, device)
     optimizer = AdamW(
         model.parameters(), lr=float(cfg["LR"]), weight_decay=float(cfg["WEIGHT_DECAY"])
     )
@@ -377,15 +457,15 @@ def main() -> None:
     )
     use_amp = bool(cfg["AMP"]) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
-    start_epoch, best_val_dice_tumor, stale_epochs = 1, float("-inf"), 0
+    start_epoch, best_val_loss, stale_epochs = 1, float("inf"), 0
     resume_path = str(cfg["RESUME_PATH"]).strip()
     if resume_path:
-        start_epoch, best_val_dice_tumor, stale_epochs = restore_training_state(
+        start_epoch, best_val_loss, stale_epochs = restore_training_state(
             Path(resume_path), model, optimizer, scheduler, scaler, device
         )
         print(
             f"[RESUME] checkpoint={resume_path} start_epoch={start_epoch} "
-            f"best_val_dice_tumor={best_val_dice_tumor:.6f} stale_epochs={stale_epochs}"
+            f"best_val_loss={best_val_loss:.6f} stale_epochs={stale_epochs}"
         )
     wandb_run = _wandb_run(cfg)
     train_step_logger = _wandb_step_logger(wandb_run, "train")
@@ -434,15 +514,15 @@ def main() -> None:
             if wandb_run is not None:
                 wandb_run.log(log)
             should_stop = False
-            val_dice_tumor = val_metrics["dice_tumor"]
-            if np.isfinite(val_dice_tumor) and val_dice_tumor > best_val_dice_tumor:
-                best_val_dice_tumor, stale_epochs = val_dice_tumor, 0
+            val_loss = val_metrics["loss"]
+            if np.isfinite(val_loss) and val_loss < best_val_loss:
+                best_val_loss, stale_epochs = val_loss, 0
             else:
                 stale_epochs += 1
                 if stale_epochs >= int(cfg["EARLY_STOPPING_PATIENCE"]):
                     should_stop = True
                     print(
-                        f"Early stopping after {stale_epochs} epochs without val_dice_tumor improvement."
+                        f"Early stopping after {stale_epochs} epochs without val_loss improvement."
                     )
             scheduler.step()
             state = {
@@ -451,7 +531,7 @@ def main() -> None:
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
                 "scaler_state": scaler.state_dict() if scaler is not None else None,
-                "best_val_dice_tumor": best_val_dice_tumor,
+                "best_val_loss": best_val_loss,
                 "stale_epochs": stale_epochs,
                 "config": cfg,
                 "model_config": model_config,
