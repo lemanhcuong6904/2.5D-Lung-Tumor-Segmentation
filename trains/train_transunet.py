@@ -22,7 +22,7 @@ from tqdm.auto import tqdm
 
 from data.transunet_dataset import (
     LungTumorSliceDataset,
-    PatientAwareBalancedBatchSampler,
+    TumorCoveringBatchSampler,
     build_eval_transform,
     build_loader,
     build_train_transform,
@@ -63,13 +63,9 @@ CFG: dict[str, Any] = {
     "BACKBONE_PRETRAINED": True,    #
     "BATCH_TRAIN": 16,
     "BATCH_VAL": 16,
-    "HARD_NEGATIVE_RADIUS": 4,
-    "BALANCED_TRAIN_SAMPLING": True,
-    "POSITIVE_FRACTION": 0.4,
-    "HARD_NEGATIVE_FRACTION": 0.2,
-    "EASY_NEGATIVE_FRACTION": 0.4,
-    "TRAIN_BATCHES_PER_EPOCH": 800,
-    "SAMPLER_SEED": 42,
+    # None: use every training slice once per epoch. Set an integer limit to
+    # include every tumor slice while randomly subsampling negative slices.
+    "TRAIN_BATCHES_PER_EPOCH": 1200,
     "NUM_WORKERS": 0,
     "PIN_MEMORY": True,
     "EPOCHS": 20,
@@ -77,11 +73,11 @@ CFG: dict[str, Any] = {
     "LR_MIN": 1e-6,
     "WEIGHT_DECAY": 2e-4,
     # Multiplier for target=1 pixels in BCE. Tune jointly with threshold.
-    "BCE_POS_WEIGHT": 1.2,
+    "BCE_POS_WEIGHT": 1.5,
     # Total loss = BCEWithLogitsLoss + DICE_LOSS_WEIGHT * weighted Dice loss.
     "DICE_LOSS_WEIGHT": 1.0,
     "DICE_BACKGROUND_WEIGHT": 1.0,
-    "DICE_FOREGROUND_WEIGHT": 1.2,
+    "DICE_FOREGROUND_WEIGHT": 1.5,
     "DICE_SMOOTH": 1e-6,
     "AMP": True,
     "THRESHOLD": 0.5,
@@ -351,6 +347,15 @@ def _wandb_run(cfg: dict[str, Any]) -> Any | None:
         return None
 
 
+def _wandb_finite_values(values: dict[str, float | int]) -> dict[str, float | int]:
+    """Drop NaN/Inf metrics so W&B charts contain only valid observations."""
+    return {
+        key: value
+        for key, value in values.items()
+        if not isinstance(value, (float, np.floating)) or np.isfinite(value)
+    }
+
+
 def _wandb_step_logger(
     wandb_run: Any | None, split: str
 ) -> Callable[[dict[str, float]], None] | None:
@@ -374,9 +379,13 @@ def _wandb_step_logger(
     def log(values: dict[str, float]) -> None:
         nonlocal step
         step += 1
+        finite_values = _wandb_finite_values(values)
         wandb_run.log(
             {step_key: step}
-            | {f"{split}_step_{key}": value for key, value in values.items()}
+            | {
+                f"{split}_step_{key}": value
+                for key, value in finite_values.items()
+            }
         )
 
     return log
@@ -429,7 +438,6 @@ def main() -> None:
         read_case_ids(Path(cfg["TRAIN_SPLIT"])),
         int(cfg["NUM_SLICES"]),
         build_train_transform(),
-        hard_negative_radius=int(cfg["HARD_NEGATIVE_RADIUS"]),
     )
     val_dataset = LungTumorSliceDataset(
         Path(cfg["PROCESSED_ROOT"]),
@@ -440,24 +448,17 @@ def main() -> None:
     train_loader = build_loader(
         train_dataset,
         int(cfg["BATCH_TRAIN"]),
-        not bool(cfg["BALANCED_TRAIN_SAMPLING"]),
+        True,
         int(cfg["NUM_WORKERS"]),
         bool(cfg["PIN_MEMORY"]),
         batch_sampler=(
-            PatientAwareBalancedBatchSampler(
+            TumorCoveringBatchSampler(
                 train_dataset,
                 batch_size=int(cfg["BATCH_TRAIN"]),
-                batches_per_epoch=(
-                    None
-                    if cfg["TRAIN_BATCHES_PER_EPOCH"] is None
-                    else int(cfg["TRAIN_BATCHES_PER_EPOCH"])
-                ),
-                seed=int(cfg["SAMPLER_SEED"]),
-                positive_fraction=float(cfg["POSITIVE_FRACTION"]),
-                hard_negative_fraction=float(cfg["HARD_NEGATIVE_FRACTION"]),
-                easy_negative_fraction=float(cfg["EASY_NEGATIVE_FRACTION"]),
+                batches_per_epoch=int(cfg["TRAIN_BATCHES_PER_EPOCH"]),
+                seed=int(cfg["SEED"]),
             )
-            if bool(cfg["BALANCED_TRAIN_SAMPLING"])
+            if cfg["TRAIN_BATCHES_PER_EPOCH"] is not None
             else None
         ),
     )
@@ -544,7 +545,7 @@ def main() -> None:
             }
             print(log)
             if wandb_run is not None:
-                wandb_run.log(log)
+                wandb_run.log(_wandb_finite_values(log))
             should_stop = False
             val_loss = val_metrics["loss"]
             if np.isfinite(val_loss) and val_loss < best_val_loss:

@@ -291,6 +291,74 @@ class PatientAwareBalancedBatchSampler(BatchSampler):
         return self.batches_per_epoch
 
 
+class TumorCoveringBatchSampler(BatchSampler):
+    """Limit an epoch while including every positive slice exactly once.
+
+    The remaining slots are filled with randomly selected negative slices without
+    replacement. This is not class-balanced sampling: it only guarantees that
+    the limited epoch does not discard any tumor-containing slice.
+    """
+
+    def __init__(
+        self,
+        dataset: LungTumorSliceDataset,
+        batch_size: int,
+        batches_per_epoch: int,
+        seed: int = 42,
+    ) -> None:
+        if batch_size < 1 or batches_per_epoch < 1:
+            raise ValueError("batch_size and batches_per_epoch must be positive")
+        normal_batches = math.ceil(len(dataset) / batch_size)
+        if batches_per_epoch > normal_batches:
+            raise ValueError(
+                "TRAIN_BATCHES_PER_EPOCH cannot exceed the normal number of batches"
+            )
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.batches_per_epoch = batches_per_epoch
+        self.seed = seed
+        self.epoch = 0
+        self.positive_indices = [
+            index
+            for index, item in enumerate(dataset.items)
+            if item.sample_group == "positive"
+        ]
+        self.negative_indices = [
+            index
+            for index, item in enumerate(dataset.items)
+            if item.sample_group != "positive"
+        ]
+        self.items_per_epoch = min(len(dataset), batch_size * batches_per_epoch)
+        if len(self.positive_indices) > self.items_per_epoch:
+            raise ValueError(
+                "TRAIN_BATCHES_PER_EPOCH is too small to include every positive slice"
+            )
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+        positives = list(self.positive_indices)
+        negatives = list(self.negative_indices)
+        rng.shuffle(positives)
+        rng.shuffle(negatives)
+
+        selected: list[int | None] = [None] * self.items_per_epoch
+        positions = list(range(self.items_per_epoch))
+        rng.shuffle(positions)
+        for position, index in zip(positions, positives):
+            selected[position] = index
+        remaining = (index for index in negatives)
+        for position in positions[len(positives) :]:
+            selected[position] = next(remaining)
+
+        indices = [index for index in selected if index is not None]
+        for start in range(0, len(indices), self.batch_size):
+            yield indices[start : start + self.batch_size]
+
+    def __len__(self) -> int:
+        return math.ceil(self.items_per_epoch / self.batch_size)
+
+
 def build_loader(
     dataset: Dataset[dict[str, object]],
     batch_size: int,
