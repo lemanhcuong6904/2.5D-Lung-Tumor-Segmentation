@@ -26,7 +26,7 @@ from utils.training import load_checkpoint
 CFG: dict[str, Any] = {
     # Set this after training the notebook TransUNet. The previous ResNet-50
     # checkpoint is incompatible with this architecture.
-    "CHECKPOINT_PATH": r"D:\2.5D Lung Tumor Segmentation\experiments\transunet_2d\best.pt",
+    "CHECKPOINT_PATH": r"D:\2.5D Lung Tumor Segmentation\experiments\transunet_2d_BCE_Dice\best.pt",
     "SPLIT_PATH": str(ROOT_DIR / "data" / "config" / "test.txt"),
     "PROCESSED_ROOT": str(ROOT_DIR / "data" / "processed"),
     "NIFTI_ROOT": str(ROOT_DIR / "data" / "nifti"),

@@ -22,6 +22,7 @@ from tqdm.auto import tqdm
 
 from data.transunet_dataset import (
     LungTumorSliceDataset,
+    PatientAwareBalancedBatchSampler,
     TumorCoveringBatchSampler,
     build_eval_transform,
     build_loader,
@@ -44,7 +45,7 @@ from utils.training import (
 )
 
 CFG: dict[str, Any] = {
-    "EXP_NAME": "transunet_2d_BCE_Dice",
+    "EXP_NAME": "transunet_2d_BCE_Dice_balanced_sampling",
     "PROCESSED_ROOT": str(ROOT_DIR / "data" / "processed"),
     "NIFTI_ROOT": str(ROOT_DIR / "data" / "nifti"),
     "TRAIN_SPLIT": str(ROOT_DIR / "data" / "config" / "train.txt"),
@@ -58,26 +59,34 @@ CFG: dict[str, Any] = {
     "TRANSFORMER_DEPTH": 8,
     "TRANSFORMER_HEADS": 4,
     "MLP_DIM": 512,
-    "MLP_RATIO": 0.5,   #
+    "MLP_RATIO": 0.5,  #
     "DROPOUT": 0.05,
-    "BACKBONE_PRETRAINED": True,    #
+    "BACKBONE_PRETRAINED": True,  #
     "BATCH_TRAIN": 16,
     "BATCH_VAL": 16,
+    "HARD_NEGATIVE_RADIUS": 4,
+    # True: patient-aware positive/hard/easy-negative sampling. False: use
+    # the natural slice distribution (optionally with the epoch limit below).
+    "BALANCED_TRAIN_SAMPLING": True,
+    "POSITIVE_FRACTION": 0.3,
+    "HARD_NEGATIVE_FRACTION": 0.35,
+    "EASY_NEGATIVE_FRACTION": 0.35,
     # None: use every training slice once per epoch. Set an integer limit to
     # include every tumor slice while randomly subsampling negative slices.
-    "TRAIN_BATCHES_PER_EPOCH": 1200,
+    "TRAIN_BATCHES_PER_EPOCH": 800,
+    "SAMPLER_SEED": 42,
     "NUM_WORKERS": 0,
     "PIN_MEMORY": True,
     "EPOCHS": 20,
     "LR": 2e-4,
     "LR_MIN": 1e-6,
-    "WEIGHT_DECAY": 2e-4,
+    "WEIGHT_DECAY": 1e-4,
     # Multiplier for target=1 pixels in BCE. Tune jointly with threshold.
-    "BCE_POS_WEIGHT": 1.5,
+    "BCE_POS_WEIGHT": 1.0,
     # Total loss = BCEWithLogitsLoss + DICE_LOSS_WEIGHT * weighted Dice loss.
-    "DICE_LOSS_WEIGHT": 1.0,
+    "DICE_LOSS_WEIGHT": 1.2,
     "DICE_BACKGROUND_WEIGHT": 1.0,
-    "DICE_FOREGROUND_WEIGHT": 1.5,
+    "DICE_FOREGROUND_WEIGHT": 1.2,
     "DICE_SMOOTH": 1e-6,
     "AMP": True,
     "THRESHOLD": 0.5,
@@ -152,15 +161,15 @@ class BCEWeightedDiceLoss(torch.nn.Module):
         denominator = probabilities.sum(dim=reduce_dims) + class_targets.sum(
             dim=reduce_dims
         )
-        class_dice = (2.0 * intersection + self.smooth) / (
-            denominator + self.smooth
-        )
+        class_dice = (2.0 * intersection + self.smooth) / (denominator + self.smooth)
         # Do not score a class absent from a particular target. Background is
         # still scored on all ordinary slices and penalizes false positives.
         valid_classes = class_targets.sum(dim=reduce_dims) > 0
         weights = self.dice_class_weights.to(dtype=class_dice.dtype)
         weighted_dice = (class_dice * valid_classes * weights).sum(dim=1) / (
-            (valid_classes * weights).sum(dim=1).clamp_min(torch.finfo(class_dice.dtype).eps)
+            (valid_classes * weights)
+            .sum(dim=1)
+            .clamp_min(torch.finfo(class_dice.dtype).eps)
         )
         dice_loss = 1.0 - weighted_dice.mean()
         total_loss = bce_loss + self.dice_weight * dice_loss
@@ -313,9 +322,7 @@ def run_epoch(
             "dice_loss": float(dice_loss.detach()),
             "dice_micro": batch_summary["dice_micro"],
             "dice_tumor": batch_summary["dice_tumor"],
-            "negative_slice_specificity": batch_summary[
-                "negative_slice_specificity"
-            ],
+            "negative_slice_specificity": batch_summary["negative_slice_specificity"],
         }
         iterator.set_postfix(
             loss=f"{step_values['loss']:.4f}",
@@ -382,10 +389,7 @@ def _wandb_step_logger(
         finite_values = _wandb_finite_values(values)
         wandb_run.log(
             {step_key: step}
-            | {
-                f"{split}_step_{key}": value
-                for key, value in finite_values.items()
-            }
+            | {f"{split}_step_{key}": value for key, value in finite_values.items()}
         )
 
     return log
@@ -438,6 +442,7 @@ def main() -> None:
         read_case_ids(Path(cfg["TRAIN_SPLIT"])),
         int(cfg["NUM_SLICES"]),
         build_train_transform(),
+        hard_negative_radius=int(cfg["HARD_NEGATIVE_RADIUS"]),
     )
     val_dataset = LungTumorSliceDataset(
         Path(cfg["PROCESSED_ROOT"]),
@@ -445,22 +450,39 @@ def main() -> None:
         int(cfg["NUM_SLICES"]),
         build_eval_transform(),
     )
-    train_loader = build_loader(
-        train_dataset,
-        int(cfg["BATCH_TRAIN"]),
-        True,
-        int(cfg["NUM_WORKERS"]),
-        bool(cfg["PIN_MEMORY"]),
-        batch_sampler=(
+    train_batch_sampler = (
+        PatientAwareBalancedBatchSampler(
+            train_dataset,
+            batch_size=int(cfg["BATCH_TRAIN"]),
+            batches_per_epoch=(
+                None
+                if cfg["TRAIN_BATCHES_PER_EPOCH"] is None
+                else int(cfg["TRAIN_BATCHES_PER_EPOCH"])
+            ),
+            seed=int(cfg["SAMPLER_SEED"]),
+            positive_fraction=float(cfg["POSITIVE_FRACTION"]),
+            hard_negative_fraction=float(cfg["HARD_NEGATIVE_FRACTION"]),
+            easy_negative_fraction=float(cfg["EASY_NEGATIVE_FRACTION"]),
+        )
+        if bool(cfg["BALANCED_TRAIN_SAMPLING"])
+        else (
             TumorCoveringBatchSampler(
                 train_dataset,
                 batch_size=int(cfg["BATCH_TRAIN"]),
                 batches_per_epoch=int(cfg["TRAIN_BATCHES_PER_EPOCH"]),
-                seed=int(cfg["SEED"]),
+                seed=int(cfg["SAMPLER_SEED"]),
             )
             if cfg["TRAIN_BATCHES_PER_EPOCH"] is not None
             else None
-        ),
+        )
+    )
+    train_loader = build_loader(
+        train_dataset,
+        int(cfg["BATCH_TRAIN"]),
+        not bool(cfg["BALANCED_TRAIN_SAMPLING"]),
+        int(cfg["NUM_WORKERS"]),
+        bool(cfg["PIN_MEMORY"]),
+        batch_sampler=train_batch_sampler,
     )
     val_loader = build_loader(
         val_dataset,
@@ -539,9 +561,7 @@ def main() -> None:
                 "val_dice_loss": val_metrics["dice_loss"],
                 "val_dice_micro": val_metrics["dice_micro"],
                 "val_dice_tumor": val_metrics["dice_tumor"],
-                "val_negative_specificity": val_metrics[
-                    "negative_slice_specificity"
-                ],
+                "val_negative_specificity": val_metrics["negative_slice_specificity"],
             }
             print(log)
             if wandb_run is not None:
