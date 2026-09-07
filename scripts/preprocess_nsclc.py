@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import argparse
 import csv
-import math
 import shutil
 import uuid
 from pathlib import Path
@@ -14,6 +12,30 @@ import numpy as np
 import pydicom
 import SimpleITK as sitk
 from PIL import Image, ImageDraw
+
+# -----------------------------------------------------------------------------
+# Run configuration
+# -----------------------------------------------------------------------------
+# Set CASE_IDS to None to process every LUNG* case, or provide raw case IDs
+# such as ["LUNG1-001", "LUNG1-002"].
+RAW_ROOT = Path(r"D:\NSCLC-Radiomics")
+DATA_ROOT = Path("data")
+CASE_IDS: list[str] | None = None
+MARGIN_PX = 5
+OVERWRITE = True
+DRY_RUN = False
+HU_WINDOW_LOW = -700
+HU_WINDOW_HIGH = 500
+
+# Source DICOM SEG labels. Lung is used only to define the crop; the saved
+# label contains tumor only, binarized to 0/1.
+LUNG_SEGMENT_LABELS = {"lung"}
+TUMOR_SEGMENT_LABELS = {"neoplasm, primary"}
+# Turn this on only when source labels contain variants such as "Lung Left".
+SEGMENT_LABEL_CONTAINS_MATCH = False
+# Remove disconnected lung-label fragments smaller than this before computing
+# the crop bbox. This is measured in 3D voxels, not pixels per slice.
+LUNG_MIN_COMPONENT_VOXELS = 1_000
 
 
 def output_case_id(raw_case_id: str) -> str:
@@ -32,11 +54,11 @@ def normalize_hu_to_uint8(
 
 
 def lung_crop_region(
-    lung_mask: sitk.Image, margin_mm: float = 0.0
+    lung_mask: sitk.Image, margin_px: int = 0
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    """Return the per-case lung bbox, expanded by a physical margin."""
-    if margin_mm < 0:
-        raise ValueError("margin_mm must be non-negative")
+    """Return the per-case lung bbox, expanded by a voxel/pixel margin."""
+    if margin_px < 0:
+        raise ValueError("margin_px must be non-negative")
 
     statistics = sitk.LabelShapeStatisticsImageFilter()
     statistics.Execute(sitk.Cast(lung_mask > 0, sitk.sitkUInt8))
@@ -47,8 +69,6 @@ def lung_crop_region(
     index = list(statistics.GetBoundingBox(labels[0])[:3])
     size = list(statistics.GetBoundingBox(labels[0])[3:])
     image_size = lung_mask.GetSize()
-    spacing = lung_mask.GetSpacing()
-
     square_side = max(size[0], size[1])
     if square_side > min(image_size[0], image_size[1]):
         raise ValueError("lung bbox cannot fit into an in-plane square")
@@ -60,9 +80,8 @@ def lung_crop_region(
         size[axis] = square_side
 
     for axis in range(3):
-        margin_voxels = math.ceil(margin_mm / spacing[axis])
-        start = max(0, index[axis] - margin_voxels)
-        stop = min(image_size[axis], index[axis] + size[axis] + margin_voxels)
+        start = max(0, index[axis] - margin_px)
+        stop = min(image_size[axis], index[axis] + size[axis] + margin_px)
         index[axis] = start
         size[axis] = stop - start
 
@@ -92,9 +111,7 @@ def crop_and_resize(
     resampler.SetOutputDirection(cropped.GetDirection())
     resampler.SetTransform(sitk.Transform())
     resampler.SetDefaultPixelValue(0)
-    resampler.SetInterpolator(
-        sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear
-    )
+    resampler.SetInterpolator(sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear)
     return resampler.Execute(cropped)
 
 
@@ -141,7 +158,9 @@ def write_case_outputs(
 
         tmp_nifti.mkdir(parents=True)
         sitk.WriteImage(image, str(tmp_nifti / "image.nii.gz"))
-        sitk.WriteImage(sitk.Cast(mask > 0, sitk.sitkUInt8), str(tmp_nifti / "mask.nii.gz"))
+        sitk.WriteImage(
+            sitk.Cast(mask > 0, sitk.sitkUInt8), str(tmp_nifti / "mask.nii.gz")
+        )
         if final_processed.exists():
             final_processed.replace(backup_processed)
         if final_nifti.exists():
@@ -164,22 +183,6 @@ def write_case_outputs(
         shutil.rmtree(tmp_processed, ignore_errors=True)
         shutil.rmtree(tmp_nifti, ignore_errors=True)
         raise
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--raw-root", type=Path, default=Path(r"D:\NSCLC-Radiomics"))
-    parser.add_argument("--data-root", type=Path, default=Path("data"))
-    parser.add_argument("--case", action="append", help="Raw case ID, repeatable")
-    parser.add_argument(
-        "--margin-mm",
-        type=float,
-        default=25.0,
-        help="Physical expansion after the square lung bbox (default: 25 mm)",
-    )
-    parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    return parser
 
 
 def _dicom_headers(case_dir: Path) -> Iterable[tuple[Path, pydicom.Dataset]]:
@@ -212,7 +215,9 @@ def _load_ct(case_dir: Path) -> tuple[sitk.Image, list[Path]]:
         raise ValueError("no CT DICOM series found")
 
     paths = max(series.values(), key=len)
-    headers = [pydicom.dcmread(path, stop_before_pixels=True, force=True) for path in paths]
+    headers = [
+        pydicom.dcmread(path, stop_before_pixels=True, force=True) for path in paths
+    ]
     orientation = [float(value) for value in headers[0].ImageOrientationPatient]
     positions = [
         [float(value) for value in header.ImagePositionPatient] for header in headers
@@ -237,25 +242,34 @@ def _find_rtstruct(case_dir: Path) -> Path:
     raise ValueError("no DICOM RTSTRUCT object found")
 
 
-def _segment_numbers(dataset: pydicom.Dataset, labels: set[str]) -> list[int]:
-    wanted = {label.casefold() for label in labels}
+def _match_segment_label(segment_label: str, expected_label: str) -> bool:
+    """Use the same exact/contains SEG-label matching as the reference script."""
+    actual = segment_label.strip().casefold()
+    expected = expected_label.strip().casefold()
+    return expected in actual if SEGMENT_LABEL_CONTAINS_MATCH else actual == expected
+
+
+def _segment_numbers(dataset: pydicom.Dataset, target_labels: set[str]) -> list[int]:
     return [
         int(segment.SegmentNumber)
         for segment in dataset.SegmentSequence
-        if str(getattr(segment, "SegmentLabel", "")).casefold() in wanted
+        if any(
+            _match_segment_label(str(getattr(segment, "SegmentLabel", "")), label)
+            for label in target_labels
+        )
     ]
 
 
 def _decode_segments_to_ct(
-    seg_path: Path, labels: set[str], ct_image: sitk.Image
+    seg_path: Path, target_labels: set[str], ct_image: sitk.Image
 ) -> tuple[sitk.Image, list[str]]:
     dataset = pydicom.dcmread(seg_path, force=True)
     if getattr(dataset, "Modality", "") != "SEG":
         raise ValueError(f"not a SEG file: {seg_path}")
 
-    segment_numbers = _segment_numbers(dataset, labels)
+    segment_numbers = _segment_numbers(dataset, target_labels)
     if not segment_numbers:
-        raise ValueError(f"SEG labels not found: {sorted(labels)}")
+        raise ValueError(f"SEG labels not found: {sorted(target_labels)}")
     segment_labels = [
         str(segment.SegmentLabel)
         for segment in dataset.SegmentSequence
@@ -265,13 +279,20 @@ def _decode_segments_to_ct(
     mask = np.zeros(sitk.GetArrayFromImage(ct_image).shape, dtype=np.uint8)
     ct_size = ct_image.GetSize()
     frames = dataset.pixel_array
-    for frame, groups in zip(frames, dataset.PerFrameFunctionalGroupsSequence, strict=True):
-        segment_number = int(groups.SegmentIdentificationSequence[0].ReferencedSegmentNumber)
+    for frame, groups in zip(
+        frames, dataset.PerFrameFunctionalGroupsSequence, strict=True
+    ):
+        segment_number = int(
+            groups.SegmentIdentificationSequence[0].ReferencedSegmentNumber
+        )
         if segment_number not in segment_numbers:
             continue
         if frame.shape != (ct_size[1], ct_size[0]):
             raise ValueError("SEG in-plane size does not match CT")
-        position = tuple(float(value) for value in groups.PlanePositionSequence[0].ImagePositionPatient)
+        position = tuple(
+            float(value)
+            for value in groups.PlanePositionSequence[0].ImagePositionPatient
+        )
         try:
             x, y, z = ct_image.TransformPhysicalPointToIndex(position)
         except RuntimeError as error:
@@ -296,27 +317,60 @@ def derive_lung_mask_from_ct(ct_image: sitk.Image) -> sitk.Image:
     candidates = []
     for label in statistics.GetLabels():
         x, y, _, width, height, _ = statistics.GetBoundingBox(label)
-        touches_image_edge = x == 0 or y == 0 or x + width == size_x or y + height == size_y
+        touches_image_edge = (
+            x == 0 or y == 0 or x + width == size_x or y + height == size_y
+        )
         if not touches_image_edge:
             candidates.append((statistics.GetNumberOfPixels(label), label))
     selected = [label for _, label in sorted(candidates, reverse=True)[:2]]
     if not selected:
         raise ValueError("could not derive internal lung components from CT")
-    derived = sitk.GetImageFromArray(np.isin(sitk.GetArrayFromImage(connected), selected).astype(np.uint8))
+    derived = sitk.GetImageFromArray(
+        np.isin(sitk.GetArrayFromImage(connected), selected).astype(np.uint8)
+    )
     derived.CopyInformation(ct_image)
     return derived
 
 
-def _decode_rtstruct_tumor_to_ct(rtstruct_path: Path, ct_image: sitk.Image) -> tuple[sitk.Image, list[str]]:
+def remove_small_lung_components(
+    lung_mask: sitk.Image, minimum_voxels: int
+) -> tuple[sitk.Image, int]:
+    """Remove small disconnected 3D fragments from a lung mask."""
+    if minimum_voxels < 1:
+        raise ValueError("minimum_voxels must be at least 1")
+
+    connected = sitk.ConnectedComponent(sitk.Cast(lung_mask > 0, sitk.sitkUInt8))
+    statistics = sitk.LabelShapeStatisticsImageFilter()
+    statistics.Execute(connected)
+    kept_labels = [
+        label
+        for label in statistics.GetLabels()
+        if statistics.GetNumberOfPixels(label) >= minimum_voxels
+    ]
+    if not kept_labels:
+        raise ValueError("lung mask has no component above the minimum size")
+
+    cleaned_array = np.isin(
+        sitk.GetArrayFromImage(connected), kept_labels
+    ).astype(np.uint8)
+    cleaned = sitk.GetImageFromArray(cleaned_array)
+    cleaned.CopyInformation(lung_mask)
+    return cleaned, len(statistics.GetLabels()) - len(kept_labels)
+
+
+def _decode_rtstruct_tumor_to_ct(
+    rtstruct_path: Path, ct_image: sitk.Image
+) -> tuple[sitk.Image, list[str]]:
     """Rasterize GTV contours from an RTSTRUCT into the CT voxel grid."""
     dataset = pydicom.dcmread(rtstruct_path, force=True)
     roi_names = {
-        int(roi.ROINumber): str(roi.ROIName)
-        for roi in dataset.StructureSetROISequence
+        int(roi.ROINumber): str(roi.ROIName) for roi in dataset.StructureSetROISequence
     }
     exact = {number for number, name in roi_names.items() if name.casefold() == "gtv-1"}
     selected = exact or {
-        number for number, name in roi_names.items() if name.casefold().startswith("gtv")
+        number
+        for number, name in roi_names.items()
+        if name.casefold().startswith("gtv")
     }
     if not selected:
         raise ValueError("RTSTRUCT does not contain a GTV contour")
@@ -328,7 +382,10 @@ def _decode_rtstruct_tumor_to_ct(rtstruct_path: Path, ct_image: sitk.Image) -> t
             continue
         for contour in getattr(roi_contour, "ContourSequence", []):
             points = np.asarray(contour.ContourData, dtype=np.float64).reshape(-1, 3)
-            indices = [ct_image.TransformPhysicalPointToContinuousIndex(tuple(point)) for point in points]
+            indices = [
+                ct_image.TransformPhysicalPointToContinuousIndex(tuple(point))
+                for point in points
+            ]
             z_values = [point[2] for point in indices]
             z_index = int(round(float(np.mean(z_values))))
             if not 0 <= z_index < ct_size[2]:
@@ -336,7 +393,9 @@ def _decode_rtstruct_tumor_to_ct(rtstruct_path: Path, ct_image: sitk.Image) -> t
             polygon = [(point[0], point[1]) for point in indices]
             raster = Image.new("L", (ct_size[0], ct_size[1]), 0)
             ImageDraw.Draw(raster).polygon(polygon, outline=1, fill=1)
-            mask[z_index] = np.maximum(mask[z_index], np.asarray(raster, dtype=np.uint8))
+            mask[z_index] = np.maximum(
+                mask[z_index], np.asarray(raster, dtype=np.uint8)
+            )
 
     if not mask.any():
         raise ValueError("RTSTRUCT GTV contours did not rasterize onto CT")
@@ -345,8 +404,14 @@ def _decode_rtstruct_tumor_to_ct(rtstruct_path: Path, ct_image: sitk.Image) -> t
     return output, [roi_names[number] for number in sorted(selected)]
 
 
-def _normalize_ct_image(ct_image: sitk.Image) -> sitk.Image:
-    normalized = sitk.GetImageFromArray(normalize_hu_to_uint8(sitk.GetArrayFromImage(ct_image)))
+def _normalize_ct_image(
+    ct_image: sitk.Image, hu_window_low: int, hu_window_high: int
+) -> sitk.Image:
+    normalized = sitk.GetImageFromArray(
+        normalize_hu_to_uint8(
+            sitk.GetArrayFromImage(ct_image), hu_window_low, hu_window_high
+        )
+    )
     normalized.CopyInformation(ct_image)
     return normalized
 
@@ -355,13 +420,20 @@ def process_case(
     case_dir: Path,
     processed_root: Path,
     nifti_root: Path,
-    margin_mm: float,
+    margin_px: int,
     overwrite: bool,
     dry_run: bool = False,
 ) -> dict[str, str]:
     case_id = output_case_id(case_dir.name)
-    result = {"raw_case_id": case_dir.name, "case_id": case_id, "status": "ok", "message": ""}
-    output_exists = (processed_root / case_id).exists() or (nifti_root / case_id).exists()
+    result = {
+        "raw_case_id": case_dir.name,
+        "case_id": case_id,
+        "status": "ok",
+        "message": "",
+    }
+    output_exists = (processed_root / case_id).exists() or (
+        nifti_root / case_id
+    ).exists()
     if output_exists and not overwrite:
         result.update(status="skipped", message="output already exists")
         return result
@@ -375,21 +447,23 @@ def process_case(
     lung_labels: list[str]
     if seg_path is not None:
         try:
-            lung_mask, lung_labels = _decode_segments_to_ct(seg_path, {"lung"}, ct_image)
+            lung_mask, lung_labels = _decode_segments_to_ct(
+                seg_path, LUNG_SEGMENT_LABELS, ct_image
+            )
         except ValueError:
             lung_mask = derive_lung_mask_from_ct(ct_image)
             lung_labels = ["CT-derived lung fallback"]
     else:
         lung_mask = derive_lung_mask_from_ct(ct_image)
         lung_labels = ["CT-derived lung fallback"]
+    lung_mask, removed_lung_components = remove_small_lung_components(
+        lung_mask, LUNG_MIN_COMPONENT_VOXELS
+    )
 
     if seg_path is not None:
-        dataset = pydicom.dcmread(seg_path, stop_before_pixels=True, force=True)
-        all_labels = {str(segment.SegmentLabel).casefold() for segment in dataset.SegmentSequence}
-        tumor_labels = {"gtv-1"} if "gtv-1" in all_labels else {"neoplasm, primary"}
         try:
             tumor_mask, selected_tumor_labels = _decode_segments_to_ct(
-                seg_path, tumor_labels, ct_image
+                seg_path, TUMOR_SEGMENT_LABELS, ct_image
             )
         except ValueError:
             rtstruct_path = _find_rtstruct(case_dir)
@@ -401,14 +475,19 @@ def process_case(
         tumor_mask, selected_tumor_labels = _decode_rtstruct_tumor_to_ct(
             rtstruct_path, ct_image
         )
-    region = lung_crop_region(lung_mask, margin_mm)
-    image_final = crop_and_resize(_normalize_ct_image(ct_image), region, is_label=False)
+    region = lung_crop_region(lung_mask, margin_px)
+    image_final = crop_and_resize(
+        _normalize_ct_image(ct_image, HU_WINDOW_LOW, HU_WINDOW_HIGH),
+        region,
+        is_label=False,
+    )
     mask_final = crop_and_resize(tumor_mask, region, is_label=True)
 
     result.update(
         ct_slices=str(len(ct_paths)),
         seg_path=str(seg_path or ""),
         lung_labels=";".join(lung_labels),
+        removed_lung_components=str(removed_lung_components),
         tumor_labels=";".join(selected_tumor_labels),
         crop_index=str(region[0]),
         crop_size=str(region[1]),
@@ -417,7 +496,12 @@ def process_case(
     )
     if not dry_run:
         write_case_outputs(
-            processed_root, nifti_root, case_id, image_final, mask_final, overwrite=overwrite
+            processed_root,
+            nifti_root,
+            case_id,
+            image_final,
+            mask_final,
+            overwrite=overwrite,
         )
     return result
 
@@ -431,12 +515,11 @@ def _write_report(rows: list[dict[str, str]], report_path: Path) -> None:
         writer.writerows(rows)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    if args.margin_mm < 0:
-        raise SystemExit("--margin-mm must be non-negative")
-    all_cases = sorted(path for path in args.raw_root.glob("LUNG*") if path.is_dir())
-    requested = set(args.case or [])
+def main() -> int:
+    if MARGIN_PX < 0:
+        raise SystemExit("MARGIN_PX must be non-negative")
+    all_cases = sorted(path for path in RAW_ROOT.glob("LUNG*") if path.is_dir())
+    requested = set(CASE_IDS or [])
     cases = [path for path in all_cases if not requested or path.name in requested]
     if requested and len(cases) != len(requested):
         missing = sorted(requested - {path.name for path in cases})
@@ -447,11 +530,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             row = process_case(
                 case_dir,
-                args.data_root / "processed",
-                args.data_root / "nifti",
-                args.margin_mm,
-                args.overwrite,
-                args.dry_run,
+                DATA_ROOT / "processed",
+                DATA_ROOT / "nifti",
+                MARGIN_PX,
+                OVERWRITE,
+                DRY_RUN,
             )
         except Exception as error:
             row = {
@@ -462,7 +545,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         rows.append(row)
         print(f"{row['status'].upper()}: {case_dir.name} {row.get('message', '')}")
-    _write_report(rows, args.data_root / "processing_report.csv")
+    _write_report(rows, DATA_ROOT / "processing_report.csv")
     return 0 if all(row["status"] != "failed" for row in rows) else 1
 
 
