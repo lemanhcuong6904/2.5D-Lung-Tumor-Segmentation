@@ -142,8 +142,8 @@ def plot_joint_distribution(table: pd.DataFrame, quantiles: tuple[float, float],
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--nifti-root", type=Path, default=Path("data/nifti"))
-    parser.add_argument("--config-root", type=Path, default=Path("data/config"))
+    parser.add_argument("--nifti-root", type=Path, default=Path("data/nsclc-radiomics/nifti"))
+    parser.add_argument("--config-root", type=Path, default=Path("data/nsclc-radiomics/config"))
     parser.add_argument("--output-dir", type=Path, default=Path("output/figures"))
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)

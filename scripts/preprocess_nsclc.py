@@ -1,9 +1,14 @@
-"""Preprocess NSCLC-Radiomics DICOM cases into PNG and NIfTI datasets."""
+"""Shared image, DICOM, and output utilities for NSCLC preprocessing.
+
+Use ``preprocess_nsclc_radiomics.py`` or
+``preprocess_nsclc_radiogenomics.py`` as the executable entry point.
+"""
 
 from __future__ import annotations
 
 import csv
 import shutil
+import subprocess
 import uuid
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -18,19 +23,17 @@ from PIL import Image, ImageDraw
 # -----------------------------------------------------------------------------
 # Set CASE_IDS to None to process every LUNG* case, or provide raw case IDs
 # such as ["LUNG1-001", "LUNG1-002"].
-RAW_ROOT = Path(r"D:\NSCLC-Radiomics")
-DATA_ROOT = Path("data")
-CASE_IDS: list[str] | None = None
-MARGIN_PX = 5
-OVERWRITE = True
-DRY_RUN = False
 HU_WINDOW_LOW = -700
 HU_WINDOW_HIGH = 500
+TOTALSEGMENTATOR_TASK = "total"
 
 # Source DICOM SEG labels. Lung is used only to define the crop; the saved
 # label contains tumor only, binarized to 0/1.
 LUNG_SEGMENT_LABELS = {"lung"}
 TUMOR_SEGMENT_LABELS = {"neoplasm, primary"}
+# NSCLC-Radiogenomics uses inconsistent SEG label text for the same tumour
+# contour. These are tumour masks, not cardiac/normal-tissue annotations.
+RADIOGENOMICS_TUMOR_SEGMENT_LABELS = {"heart", "tissue", "segmentation"}
 # Turn this on only when source labels contain variants such as "Lung Left".
 SEGMENT_LABEL_CONTAINS_MATCH = False
 # Remove disconnected lung-label fragments smaller than this before computing
@@ -54,9 +57,15 @@ def normalize_hu_to_uint8(
 
 
 def lung_crop_region(
-    lung_mask: sitk.Image, margin_px: int = 0
+    lung_mask: sitk.Image, margin_px: int = 0, *, margin_mm: float | None = None
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     """Return the per-case lung bbox, expanded by a voxel/pixel margin."""
+    if margin_mm is not None:
+        if margin_mm < 0:
+            raise ValueError("margin_mm must be non-negative")
+        # A physical margin cannot be represented by one universal pixel
+        # count on anisotropic CT.  Use the most conservative in-plane count.
+        margin_px = int(np.ceil(margin_mm / min(lung_mask.GetSpacing()[:2])))
     if margin_px < 0:
         raise ValueError("margin_px must be non-negative")
 
@@ -279,12 +288,23 @@ def _decode_segments_to_ct(
     mask = np.zeros(sitk.GetArrayFromImage(ct_image).shape, dtype=np.uint8)
     ct_size = ct_image.GetSize()
     frames = dataset.pixel_array
+    shared_groups = getattr(dataset, "SharedFunctionalGroupsSequence", [])
+    shared_segment_identification = (
+        getattr(shared_groups[0], "SegmentIdentificationSequence", None)
+        if shared_groups
+        else None
+    )
     for frame, groups in zip(
         frames, dataset.PerFrameFunctionalGroupsSequence, strict=True
     ):
-        segment_number = int(
-            groups.SegmentIdentificationSequence[0].ReferencedSegmentNumber
-        )
+        # Some valid SEG objects store this value in the shared functional
+        # group because every frame belongs to the same segment.
+        segment_identification = getattr(
+            groups, "SegmentIdentificationSequence", None
+        ) or shared_segment_identification
+        if not segment_identification:
+            raise ValueError("SEG frame has no segment identification")
+        segment_number = int(segment_identification[0].ReferencedSegmentNumber)
         if segment_number not in segment_numbers:
             continue
         if frame.shape != (ct_size[1], ct_size[0]):
@@ -416,13 +436,100 @@ def _normalize_ct_image(
     return normalized
 
 
+def clip_hu_image(ct_image: sitk.Image, low: int, high: int) -> sitk.Image:
+    """Clip a CT in HU while preserving its complete physical geometry.
+
+    This is deliberately different from ``_normalize_ct_image``: the
+    TotalSegmentator model must receive CT intensities in HU, not the uint8
+    PNG representation used by the training dataset.
+    """
+    if low >= high:
+        raise ValueError("HU lower bound must be less than upper bound")
+    clipped = np.clip(sitk.GetArrayFromImage(ct_image), low, high).astype(np.int16)
+    output = sitk.GetImageFromArray(clipped)
+    output.CopyInformation(ct_image)
+    return output
+
+
+def _read_totalsegmentator_lung_mask(
+    output_dir: Path, reference: sitk.Image
+) -> sitk.Image:
+    """Combine TotalSegmentator lung-lobe masks into a CT-grid lung mask."""
+    candidates = sorted(
+        path for path in output_dir.glob("*.nii*")
+        if path.name.casefold().startswith("lung_")
+    )
+    if not candidates:
+        available = ", ".join(path.name for path in sorted(output_dir.glob("*.nii*")))
+        raise ValueError(
+            "TotalSegmentator produced no lung-lobe mask"
+            + (f" (found: {available})" if available else "")
+        )
+
+    combined = np.zeros(sitk.GetArrayFromImage(reference).shape, dtype=np.uint8)
+    for path in candidates:
+        mask = sitk.ReadImage(str(path))
+        if mask.GetSize() != reference.GetSize() or not np.allclose(mask.GetSpacing(), reference.GetSpacing()):
+            mask = sitk.Resample(mask, reference, sitk.Transform(), sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+        combined |= sitk.GetArrayFromImage(mask).astype(bool).astype(np.uint8)
+    if not combined.any():
+        raise ValueError("TotalSegmentator lung mask is empty")
+    output = sitk.GetImageFromArray(combined)
+    output.CopyInformation(reference)
+    return output
+
+def segment_lung_with_totalsegmentator(
+    ct_hu_clipped: sitk.Image,
+    case_id: str,
+    staging_root: Path,
+    executable: str = "TotalSegmentator",
+    task: str = TOTALSEGMENTATOR_TASK,
+    device: str | None = None,
+    overwrite: bool = False,
+    lung_rois: Sequence[str] | None = None,
+) -> tuple[sitk.Image, Path, Path]:
+    """Persist a HU NIfTI and create/load a TotalSegmentator lung mask.
+
+    The external model is intentionally invoked through its CLI. This keeps
+    preprocessing importable on machines that only need Radiomics and avoids
+    downloading model weights until a Radiogenomics case is actually run.
+    """
+    case_root = staging_root / case_id
+    input_path = case_root / "ct_hu_clipped.nii.gz"
+    output_dir = case_root / "totalsegmentator"
+    if overwrite and output_dir.exists():
+        shutil.rmtree(output_dir)
+    case_root.mkdir(parents=True, exist_ok=True)
+    if overwrite or not input_path.exists():
+        sitk.WriteImage(ct_hu_clipped, str(input_path))
+    if not output_dir.exists() or not any(output_dir.glob("*.nii*")):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        command = [executable, "-i", str(input_path), "-o", str(output_dir), "--task", task]
+        if lung_rois:
+            command.extend(["--roi_subset", *lung_rois])
+        if device:
+            command.extend(["--device", device])
+        try:
+            subprocess.run(command, check=True)
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                "TotalSegmentator was not found. Install it with `pip install TotalSegmentator` "
+                "and ensure its CLI is on PATH, or pass --totalsegmentator-bin."
+            ) from error
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(f"TotalSegmentator failed for {case_id} (exit {error.returncode})") from error
+    return _read_totalsegmentator_lung_mask(output_dir, ct_hu_clipped), input_path, output_dir
+
+
 def process_case(
     case_dir: Path,
     processed_root: Path,
     nifti_root: Path,
-    margin_px: int,
+    margin_mm: float,
     overwrite: bool,
     dry_run: bool = False,
+    hu_window_low: int = HU_WINDOW_LOW,
+    hu_window_high: int = HU_WINDOW_HIGH,
 ) -> dict[str, str]:
     case_id = output_case_id(case_dir.name)
     result = {
@@ -475,9 +582,9 @@ def process_case(
         tumor_mask, selected_tumor_labels = _decode_rtstruct_tumor_to_ct(
             rtstruct_path, ct_image
         )
-    region = lung_crop_region(lung_mask, margin_px)
+    region = lung_crop_region(lung_mask, margin_mm=margin_mm)
     image_final = crop_and_resize(
-        _normalize_ct_image(ct_image, HU_WINDOW_LOW, HU_WINDOW_HIGH),
+        _normalize_ct_image(ct_image, hu_window_low, hu_window_high),
         region,
         is_label=False,
     )
@@ -506,6 +613,69 @@ def process_case(
     return result
 
 
+def process_radiogenomics_case(
+    case_dir: Path,
+    processed_root: Path,
+    nifti_root: Path,
+    staging_root: Path,
+    margin_mm: float,
+    overwrite: bool,
+    totalsegmentator_bin: str,
+    totalsegmentator_task: str,
+    totalsegmentator_device: str | None,
+    dry_run: bool = False,
+    hu_window_low: int = HU_WINDOW_LOW,
+    hu_window_high: int = HU_WINDOW_HIGH,
+    totalsegmentator_lung_rois: Sequence[str] | None = None,
+) -> dict[str, str]:
+    """Process one Rxx-xxx case with TotalSegmentator lungs and native tumour SEG."""
+    case_id = output_case_id(case_dir.name)
+    result = {"raw_case_id": case_dir.name, "case_id": case_id, "status": "ok", "message": ""}
+    if ((processed_root / case_id).exists() or (nifti_root / case_id).exists()) and not overwrite:
+        result.update(status="skipped", message="output already exists")
+        return result
+
+    ct_image, ct_paths = _load_ct(case_dir)
+    hu_clipped = clip_hu_image(ct_image, hu_window_low, hu_window_high)
+    if dry_run:
+        lung_mask = derive_lung_mask_from_ct(ct_image)
+        lung_label = "CT-derived lung fallback (dry run)"
+        input_path, totalseg_dir = staging_root / case_id / "ct_hu_clipped.nii.gz", staging_root / case_id / "totalsegmentator"
+    else:
+        lung_mask, input_path, totalseg_dir = segment_lung_with_totalsegmentator(
+            hu_clipped, case_id, staging_root, executable=totalsegmentator_bin,
+            task=totalsegmentator_task, device=totalsegmentator_device, overwrite=overwrite,
+            lung_rois=totalsegmentator_lung_rois,
+        )
+        lung_label = "TotalSegmentator:lung_lobes"
+
+    try:
+        seg_path = _find_seg(case_dir)
+        tumor_mask, selected_tumor_labels = _decode_segments_to_ct(
+            seg_path, RADIOGENOMICS_TUMOR_SEGMENT_LABELS, ct_image
+        )
+    except ValueError:
+        rtstruct_path = _find_rtstruct(case_dir)
+        tumor_mask, selected_tumor_labels = _decode_rtstruct_tumor_to_ct(
+            rtstruct_path, ct_image
+        )
+
+    lung_mask, removed_lung_components = remove_small_lung_components(lung_mask, LUNG_MIN_COMPONENT_VOXELS)
+    region = lung_crop_region(lung_mask, margin_mm=margin_mm)
+    image_final = crop_and_resize(_normalize_ct_image(ct_image, hu_window_low, hu_window_high), region, is_label=False)
+    mask_final = crop_and_resize(tumor_mask, region, is_label=True)
+    result.update(
+        ct_slices=str(len(ct_paths)), lung_source="TotalSegmentator", lung_labels=lung_label,
+        tumor_source="DICOM SEG/RTSTRUCT", tumor_labels=";".join(selected_tumor_labels),
+        crop_index=str(region[0]), crop_size=str(region[1]), final_size=str(image_final.GetSize()),
+        final_spacing=str(image_final.GetSpacing()),
+    )
+    result.update(totalsegmentator_input=str(input_path), totalsegmentator_output=str(totalseg_dir))
+    if not dry_run:
+        write_case_outputs(processed_root, nifti_root, case_id, image_final, mask_final, overwrite=overwrite)
+    return result
+
+
 def _write_report(rows: list[dict[str, str]], report_path: Path) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     fields = sorted({field for row in rows for field in row})
@@ -513,41 +683,3 @@ def _write_report(rows: list[dict[str, str]], report_path: Path) -> None:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
-
-
-def main() -> int:
-    if MARGIN_PX < 0:
-        raise SystemExit("MARGIN_PX must be non-negative")
-    all_cases = sorted(path for path in RAW_ROOT.glob("LUNG*") if path.is_dir())
-    requested = set(CASE_IDS or [])
-    cases = [path for path in all_cases if not requested or path.name in requested]
-    if requested and len(cases) != len(requested):
-        missing = sorted(requested - {path.name for path in cases})
-        raise SystemExit(f"requested cases not found: {', '.join(missing)}")
-
-    rows: list[dict[str, str]] = []
-    for case_dir in cases:
-        try:
-            row = process_case(
-                case_dir,
-                DATA_ROOT / "processed",
-                DATA_ROOT / "nifti",
-                MARGIN_PX,
-                OVERWRITE,
-                DRY_RUN,
-            )
-        except Exception as error:
-            row = {
-                "raw_case_id": case_dir.name,
-                "case_id": output_case_id(case_dir.name),
-                "status": "failed",
-                "message": str(error),
-            }
-        rows.append(row)
-        print(f"{row['status'].upper()}: {case_dir.name} {row.get('message', '')}")
-    _write_report(rows, DATA_ROOT / "processing_report.csv")
-    return 0 if all(row["status"] != "failed" for row in rows) else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

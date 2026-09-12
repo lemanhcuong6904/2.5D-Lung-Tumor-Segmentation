@@ -34,6 +34,14 @@ logs/
 data/raw/
 data/processed/
 data/nifti/
+data/nsclc-radiomics/processed/
+data/nsclc-radiomics/nifti/
+data/nsclc-radiomics/processing_report.csv
+data/nsclc-radiomics/nsclc_radiogenomics/processed/
+data/nsclc-radiomics/nsclc_radiogenomics/nifti/
+data/nsclc-radiomics/nsclc_radiogenomics/intermediate/
+data/nsclc-radiomics/nsclc_radiogenomics/reports/
+data/nsclc-radiomics/nsclc_radiogenomics/processing_report.csv
 
 # Model exports and temporary files
 *.onnx

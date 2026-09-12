@@ -38,6 +38,11 @@ TRAIN_COUNT = 260
 VAL_COUNT = 60
 SEED = 42
 
+DATASET_ROOTS = {
+    "radiomics": Path("data/nsclc-radiomics"),
+    "radiogenomics": Path("data/nsclc-radiomics/nsclc_radiogenomics"),
+}
+
 
 def largest_remainder_allocation(total: int, group_sizes: dict[str, int]) -> dict[str, int]:
     """Allocate ``total`` proportionally without exceeding any group size."""
@@ -156,8 +161,9 @@ def create_split(nifti_root: Path, seed: int) -> tuple[list[str], list[str], lis
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--nifti-root", type=Path, default=Path("data/nifti"))
-    parser.add_argument("--output-dir", type=Path, default=Path("data/config"))
+    parser.add_argument("--dataset", choices=sorted(DATASET_ROOTS), default="radiomics")
+    parser.add_argument("--nifti-root", type=Path)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--overwrite", action="store_true")
     return parser
@@ -165,11 +171,41 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    train, val, test, unused, strata = create_split(args.nifti_root, args.seed)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    write_case_list(args.output_dir / "train.txt", train, args.overwrite)
-    write_case_list(args.output_dir / "val.txt", val, args.overwrite)
-    write_case_list(args.output_dir / "test.txt", test, args.overwrite)
+    dataset_root = DATASET_ROOTS[args.dataset]
+    nifti_root = args.nifti_root or dataset_root / "nifti"
+    output_dir = args.output_dir or dataset_root / "config"
+    if args.dataset == "radiomics":
+        train, val, test, unused, strata = create_split(nifti_root, args.seed)
+    else:
+        # Radiogenomics has 144 Rxx-xxx patients rather than the fixed
+        # Radiomics cohort.  Generate patient-level 80/10/10 splits, while
+        # preserving volume/location stratification from the common helper.
+        case_ids = sorted(path.name for path in nifti_root.iterdir() if (path / "mask.nii.gz").is_file())
+        if len(case_ids) < 3:
+            raise FileNotFoundError(f"need at least three masks under {nifti_root}")
+        features = {case_id: tumor_features(nifti_root / case_id / "mask.nii.gz") for case_id in case_ids}
+        volumes = np.array([item[0] for item in features.values()])
+        q33, q67 = np.quantile(volumes, [0.33, 0.67])
+        strata_cases: dict[str, list[str]] = {}
+        for case_id, (volume, z) in features.items():
+            strata_cases.setdefault(f"{volume_group(volume, q33, q67)}_{location_group(z)}", []).append(case_id)
+        rng = np.random.default_rng(args.seed)
+        train, val, test = [], [], []
+        for group in strata_cases.values():
+            rng.shuffle(group)
+            n = len(group)
+            n_test, n_val = max(1, round(n * 0.10)), max(1, round(n * 0.10))
+            if n_test + n_val >= n:
+                n_test, n_val = 1, 0
+            test.extend(group[:n_test])
+            val.extend(group[n_test : n_test + n_val])
+            train.extend(group[n_test + n_val :])
+        train, val, test, unused = sorted(train), sorted(val), sorted(test), []
+        strata = {name: len(group) for name, group in strata_cases.items()}
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_case_list(output_dir / "train.txt", train, args.overwrite)
+    write_case_list(output_dir / "val.txt", val, args.overwrite)
+    write_case_list(output_dir / "test.txt", test, args.overwrite)
 
     print(
         f"train={len(train)}, val={len(val)}, test={len(test)}, unused={len(unused)} "

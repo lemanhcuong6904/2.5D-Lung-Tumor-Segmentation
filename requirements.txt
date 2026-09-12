@@ -1,6 +1,7 @@
 numpy
 pydicom
 SimpleITK
+TotalSegmentator
 Pillow
 pytest
 torch
@@ -10,3 +11,8 @@ scipy
 wandb
 tqdm
 platformdirs
+PyQt6
+PyQt6-WebEngine
+scikit-image
+plotly
+psutil

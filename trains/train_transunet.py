@@ -45,13 +45,15 @@ from utils.training import (
 )
 
 CFG: dict[str, Any] = {
-    "EXP_NAME": "transunet_2d_BCE_Dice_balanced_sampling",
-    "PROCESSED_ROOT": str(ROOT_DIR / "data" / "processed"),
-    "NIFTI_ROOT": str(ROOT_DIR / "data" / "nifti"),
-    "TRAIN_SPLIT": str(ROOT_DIR / "data" / "config" / "train.txt"),
-    "VAL_SPLIT": str(ROOT_DIR / "data" / "config" / "val.txt"),
+    "EXP_NAME": "transunet_2.5d-5_balanced_sampling",
+    # Switch this complete group to data/nsclc-radiomics/nsclc_radiogenomics to train on the
+    # TotalSegmentator-labelled cohort; never mix dataset roots accidentally.
+    "PROCESSED_ROOT": str(ROOT_DIR / "data" / "nsclc-radiomics" / "processed"),
+    "NIFTI_ROOT": str(ROOT_DIR / "data" / "nsclc-radiomics" / "nifti"),
+    "TRAIN_SPLIT": str(ROOT_DIR / "data" / "nsclc-radiomics" / "config" / "train.txt"),
+    "VAL_SPLIT": str(ROOT_DIR / "data" / "nsclc-radiomics" / "config" / "val.txt"),
     "SAVE_ROOT": str(ROOT_DIR / "experiments"),
-    "NUM_SLICES": 1,
+    "NUM_SLICES": 5,
     "IMAGE_SIZE": 256,
     "PATCH_DIM": 16,
     "BASE_CHANNELS": 128,
@@ -60,7 +62,7 @@ CFG: dict[str, Any] = {
     "TRANSFORMER_HEADS": 4,
     "MLP_DIM": 512,
     "MLP_RATIO": 0.5,  #
-    "DROPOUT": 0.05,
+    "DROPOUT": 0.0,
     "BACKBONE_PRETRAINED": True,  #
     "BATCH_TRAIN": 16,
     "BATCH_VAL": 16,
@@ -68,9 +70,9 @@ CFG: dict[str, Any] = {
     # True: patient-aware positive/hard/easy-negative sampling. False: use
     # the natural slice distribution (optionally with the epoch limit below).
     "BALANCED_TRAIN_SAMPLING": True,
-    "POSITIVE_FRACTION": 0.3,
-    "HARD_NEGATIVE_FRACTION": 0.35,
-    "EASY_NEGATIVE_FRACTION": 0.35,
+    "POSITIVE_FRACTION": 0.4,
+    "HARD_NEGATIVE_FRACTION": 0.2,
+    "EASY_NEGATIVE_FRACTION": 0.4,
     # None: use every training slice once per epoch. Set an integer limit to
     # include every tumor slice while randomly subsampling negative slices.
     "TRAIN_BATCHES_PER_EPOCH": 800,
@@ -82,29 +84,19 @@ CFG: dict[str, Any] = {
     "LR_MIN": 1e-6,
     "WEIGHT_DECAY": 1e-4,
     # Multiplier for target=1 pixels in BCE. Tune jointly with threshold.
-    "BCE_POS_WEIGHT": 1.0,
+    "BCE_POS_WEIGHT": 1.2,
     # Total loss = BCEWithLogitsLoss + DICE_LOSS_WEIGHT * weighted Dice loss.
-    "DICE_LOSS_WEIGHT": 1.2,
+    "DICE_LOSS_WEIGHT": 1.0,
     "DICE_BACKGROUND_WEIGHT": 1.0,
-    "DICE_FOREGROUND_WEIGHT": 1.2,
+    "DICE_FOREGROUND_WEIGHT": 1.0,
     "DICE_SMOOTH": 1e-6,
-    # Extra penalty only for GT-empty slices: mean(sigmoid(logit)). It directly
-    # discourages hallucinated tumor pixels without reducing positive recall.
-    "NEGATIVE_EMPTY_LOSS_WEIGHT": 0.2,
-    # Mine GT-empty train slices which the current model predicts as non-empty.
-    # The discovered pool is sampled more often from the following epoch.
-    "HARD_NEGATIVE_MINING_ENABLED": True,
-    "HARD_NEGATIVE_MINING_WARMUP_EPOCHS": 3,
-    "HARD_NEGATIVE_MINING_EVERY_N_EPOCHS": 1,
-    "HARD_NEGATIVE_MINING_MAX_SLICES": 1000,
-    "HARD_NEGATIVE_MINING_FRACTION": 0.15,
     "AMP": True,
     "THRESHOLD": 0.5,
     "EARLY_STOPPING_PATIENCE": 7,
     "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
     "WANDB_ENABLED": True,
     "WANDB_PROJECT": "lung-tumor-transunet",
-    "RESUME_PATH": "",  # Old ResNet-50 checkpoints are incompatible; train this architecture from scratch.
+    "RESUME_PATH": r"experiments\transunet_2.5d-5_balanced_sampling\best.pt",# Old ResNet-50 checkpoints are incompatible; train this architecture from scratch.
     "SEED": 42,
 }
 
@@ -126,7 +118,7 @@ def _model_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 class BCEWeightedDiceLoss(torch.nn.Module):
-    """Weighted BCE plus a soft Dice loss over background and tumor classes."""
+    """Weighted BCE plus a batch-level soft micro-Dice loss."""
 
     def __init__(
         self,
@@ -135,7 +127,6 @@ class BCEWeightedDiceLoss(torch.nn.Module):
         background_weight: float,
         foreground_weight: float,
         smooth: float,
-        negative_empty_weight: float,
         device: torch.device,
     ) -> None:
         super().__init__()
@@ -147,13 +138,10 @@ class BCEWeightedDiceLoss(torch.nn.Module):
             raise ValueError("Dice class weights must be positive")
         if smooth <= 0:
             raise ValueError("DICE_SMOOTH must be positive")
-        if negative_empty_weight < 0:
-            raise ValueError("NEGATIVE_EMPTY_LOSS_WEIGHT must be non-negative")
         self.bce = torch.nn.BCEWithLogitsLoss(
             pos_weight=torch.tensor(pos_weight, device=device)
         )
         self.dice_weight = dice_weight
-        self.negative_empty_weight = negative_empty_weight
         self.smooth = smooth
         self.register_buffer(
             "dice_class_weights",
@@ -162,7 +150,7 @@ class BCEWeightedDiceLoss(torch.nn.Module):
 
     def forward(
         self, logits: torch.Tensor, targets: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bce_loss = self.bce(logits, targets)
         targets = targets.float()
         foreground_probabilities = logits.sigmoid()
@@ -170,34 +158,26 @@ class BCEWeightedDiceLoss(torch.nn.Module):
             (1.0 - foreground_probabilities, foreground_probabilities), dim=1
         )
         class_targets = torch.cat((1.0 - targets, targets), dim=1)
-        reduce_dims = tuple(range(2, probabilities.ndim))
+        # Aggregate all samples and spatial pixels before computing Dice, so
+        # each class score is a micro-Dice for the entire batch.
+        reduce_dims = (0, *range(2, probabilities.ndim))
         intersection = (probabilities * class_targets).sum(dim=reduce_dims)
         denominator = probabilities.sum(dim=reduce_dims) + class_targets.sum(
             dim=reduce_dims
         )
         class_dice = (2.0 * intersection + self.smooth) / (denominator + self.smooth)
-        # Do not score a class absent from a particular target. Background is
-        # still scored on all ordinary slices and penalizes false positives.
+        # Do not score a class absent from the complete batch. Background is
+        # still scored and penalizes false positives.
         valid_classes = class_targets.sum(dim=reduce_dims) > 0
         weights = self.dice_class_weights.to(dtype=class_dice.dtype)
-        weighted_dice = (class_dice * valid_classes * weights).sum(dim=1) / (
+        weighted_dice = (class_dice * valid_classes * weights).sum() / (
             (valid_classes * weights)
-            .sum(dim=1)
+            .sum()
             .clamp_min(torch.finfo(class_dice.dtype).eps)
         )
-        dice_loss = 1.0 - weighted_dice.mean()
-        empty_target = targets.flatten(start_dim=1).sum(dim=1) == 0
-        negative_empty_loss = (
-            foreground_probabilities[empty_target].mean()
-            if empty_target.any()
-            else logits.sum() * 0.0
-        )
-        total_loss = (
-            bce_loss
-            + self.dice_weight * dice_loss
-            + self.negative_empty_weight * negative_empty_loss
-        )
-        return total_loss, bce_loss, dice_loss, negative_empty_loss
+        dice_loss = 1.0 - weighted_dice
+        total_loss = bce_loss + self.dice_weight * dice_loss
+        return total_loss, bce_loss, dice_loss
 
 
 def build_loss(cfg: dict[str, Any], device: torch.device) -> BCEWeightedDiceLoss:
@@ -208,7 +188,6 @@ def build_loss(cfg: dict[str, Any], device: torch.device) -> BCEWeightedDiceLoss
         background_weight=float(cfg["DICE_BACKGROUND_WEIGHT"]),
         foreground_weight=float(cfg["DICE_FOREGROUND_WEIGHT"]),
         smooth=float(cfg["DICE_SMOOTH"]),
-        negative_empty_weight=float(cfg["NEGATIVE_EMPTY_LOSS_WEIGHT"]),
         device=device,
     )
 
@@ -216,7 +195,7 @@ def build_loss(cfg: dict[str, Any], device: torch.device) -> BCEWeightedDiceLoss
 def _summarize_predictions(
     records: list[SlicePrediction], compute_volume_metrics: bool = True
 ) -> dict[str, float]:
-    """Aggregate slice metrics without letting one FP collapse a whole slice."""
+    """Aggregate macro slice Dice alongside pixel-level micro Dice."""
     if not records:
         raise ValueError("cannot summarize an empty prediction collection")
     slice_rows = [
@@ -237,6 +216,9 @@ def _summarize_predictions(
     micro_denominator = 2 * true_positive + false_positive + false_negative
     negative_records = [record for record in records if not record.target.any()]
     summary = {
+        # Arithmetic mean of one Dice per slice. binary_slice_metrics defines
+        # both-empty prediction/target pairs as Dice=1.
+        "dice": finite_mean([float(row["dice"]) for row in slice_rows]),
         "dice_micro": (
             1.0 if micro_denominator == 0 else 2.0 * true_positive / micro_denominator
         ),
@@ -290,8 +272,7 @@ def run_epoch(
     training = optimizer is not None
     model.train(training)
     use_amp = scaler is not None and device.type == "cuda"
-    total_loss, total_bce_loss, total_dice_loss, total_empty_loss, total_images = (
-        0.0,
+    total_loss, total_bce_loss, total_dice_loss, total_images = (
         0.0,
         0.0,
         0.0,
@@ -314,7 +295,7 @@ def run_epoch(
             device_type=device.type, enabled=use_amp
         ):
             logits = model(images)
-            loss, bce_loss, dice_loss, negative_empty_loss = criterion(logits, masks)
+            loss, bce_loss, dice_loss = criterion(logits, masks)
         if training:
             if scaler is None:
                 loss.backward()
@@ -337,7 +318,6 @@ def run_epoch(
         total_loss += float(loss.detach()) * batch_size
         total_bce_loss += float(bce_loss.detach()) * batch_size
         total_dice_loss += float(dice_loss.detach()) * batch_size
-        total_empty_loss += float(negative_empty_loss.detach()) * batch_size
         total_images += batch_size
         batch_records = [
             SlicePrediction(str(case_id), int(slice_index), prediction, target)
@@ -352,7 +332,7 @@ def run_epoch(
             "loss": float(loss.detach()),
             "bce_loss": float(bce_loss.detach()),
             "dice_loss": float(dice_loss.detach()),
-            "negative_empty_loss": float(negative_empty_loss.detach()),
+            "dice": batch_summary["dice"],
             "dice_micro": batch_summary["dice_micro"],
             "dice_tumor": batch_summary["dice_tumor"],
             "negative_slice_specificity": batch_summary["negative_slice_specificity"],
@@ -370,50 +350,7 @@ def run_epoch(
         "loss": total_loss / total_images,
         "bce_loss": total_bce_loss / total_images,
         "dice_loss": total_dice_loss / total_images,
-        "negative_empty_loss": total_empty_loss / total_images,
     } | _summarize_predictions(records, compute_volume_metrics)
-
-
-def mine_false_positive_indices(
-    model: torch.nn.Module,
-    loader: Any,
-    dataset: LungTumorSliceDataset,
-    device: torch.device,
-    threshold: float,
-    maximum: int,
-) -> list[int]:
-    """Return GT-empty train indices ranked by predicted tumor area then confidence."""
-    if maximum < 1:
-        return []
-    index_by_key = {
-        (item.case_id, item.slice_index): index
-        for index, item in enumerate(dataset.items)
-    }
-    was_training = model.training
-    model.eval()
-    candidates: list[tuple[int, float, float]] = []
-    with torch.inference_mode():
-        for batch in tqdm(loader, desc="Mining FP negatives", leave=False, dynamic_ncols=True):
-            images = batch["image"].to(device, non_blocking=True)
-            probabilities = model(images).sigmoid().cpu()[:, 0]
-            targets = batch["mask"][:, 0] > 0.5
-            for case_id, slice_index, probability, target in zip(
-                batch["case_id"],
-                batch["slice_index"].tolist(),
-                probabilities,
-                targets,
-                strict=True,
-            ):
-                if bool(target.any()):
-                    continue
-                predicted = probability >= threshold
-                area = int(predicted.sum())
-                if area:
-                    index = index_by_key[(str(case_id), int(slice_index))]
-                    candidates.append((area, float(probability.max()), index))
-    model.train(was_training)
-    candidates.sort(reverse=True)
-    return [index for _, _, index in candidates[:maximum]]
 
 
 def _wandb_run(cfg: dict[str, Any]) -> Any | None:
@@ -450,7 +387,7 @@ def _wandb_step_logger(
         "loss",
         "bce_loss",
         "dice_loss",
-        "negative_empty_loss",
+        "dice",
         "dice_micro",
         "dice_tumor",
         "negative_slice_specificity",
@@ -479,8 +416,8 @@ def restore_training_state(
     scheduler: LambdaLR,
     scaler: torch.amp.GradScaler | None,
     device: torch.device,
-) -> tuple[int, float, int]:
-    """Restore state, returning next epoch, best validation micro-Dice and patience."""
+) -> tuple[int, float, float, int]:
+    """Restore state, returning epoch, best Dice, best loss, and patience."""
     checkpoint = load_checkpoint(Path(checkpoint_path), device)
     required = {
         "epoch",
@@ -500,6 +437,7 @@ def restore_training_state(
     return (
         int(checkpoint["epoch"]) + 1,
         float(checkpoint["best_val_dice_micro"]),
+        float(checkpoint.get("best_val_loss", float("inf"))),
         int(checkpoint.get("stale_epochs", 0)),
     )
 
@@ -527,17 +465,7 @@ def main() -> None:
         int(cfg["NUM_SLICES"]),
         build_eval_transform(),
     )
-    mining_dataset = LungTumorSliceDataset(
-        Path(cfg["PROCESSED_ROOT"]),
-        read_case_ids(Path(cfg["TRAIN_SPLIT"])),
-        int(cfg["NUM_SLICES"]),
-        build_eval_transform(),
-        hard_negative_radius=int(cfg["HARD_NEGATIVE_RADIUS"]),
-    )
-    mining_enabled = bool(cfg["HARD_NEGATIVE_MINING_ENABLED"])
-    if int(cfg["HARD_NEGATIVE_MINING_EVERY_N_EPOCHS"]) < 1:
-        raise ValueError("HARD_NEGATIVE_MINING_EVERY_N_EPOCHS must be positive")
-    mining_batches = (
+    limited_batches = (
         math.ceil(len(train_dataset) / int(cfg["BATCH_TRAIN"]))
         if cfg["TRAIN_BATCHES_PER_EPOCH"] is None
         else int(cfg["TRAIN_BATCHES_PER_EPOCH"])
@@ -561,13 +489,10 @@ def main() -> None:
             TumorCoveringBatchSampler(
                 train_dataset,
                 batch_size=int(cfg["BATCH_TRAIN"]),
-                batches_per_epoch=mining_batches,
+                batches_per_epoch=limited_batches,
                 seed=int(cfg["SAMPLER_SEED"]),
-                mined_hard_negative_fraction=float(
-                    cfg["HARD_NEGATIVE_MINING_FRACTION"]
-                ),
             )
-            if cfg["TRAIN_BATCHES_PER_EPOCH"] is not None or mining_enabled
+            if cfg["TRAIN_BATCHES_PER_EPOCH"] is not None
             else None
         )
     )
@@ -581,13 +506,6 @@ def main() -> None:
     )
     val_loader = build_loader(
         val_dataset,
-        int(cfg["BATCH_VAL"]),
-        False,
-        int(cfg["NUM_WORKERS"]),
-        bool(cfg["PIN_MEMORY"]),
-    )
-    mining_loader = build_loader(
-        mining_dataset,
         int(cfg["BATCH_VAL"]),
         False,
         int(cfg["NUM_WORKERS"]),
@@ -608,21 +526,31 @@ def main() -> None:
     )
     use_amp = bool(cfg["AMP"]) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
-    start_epoch, best_val_dice_micro, stale_epochs = 1, float("-inf"), 0
+    start_epoch, best_val_dice_micro, best_val_loss, stale_epochs = (
+        1,
+        float("-inf"),
+        float("inf"),
+        0,
+    )
     resume_path = str(cfg["RESUME_PATH"]).strip()
     if resume_path:
-        start_epoch, best_val_dice_micro, stale_epochs = restore_training_state(
+        (
+            start_epoch,
+            best_val_dice_micro,
+            best_val_loss,
+            stale_epochs,
+        ) = restore_training_state(
             Path(resume_path), model, optimizer, scheduler, scaler, device
         )
         print(
             f"[RESUME] checkpoint={resume_path} start_epoch={start_epoch} "
             f"best_val_dice_micro={best_val_dice_micro:.6f} "
+            f"best_val_loss={best_val_loss:.6f} "
             f"stale_epochs={stale_epochs}"
         )
     wandb_run = _wandb_run(cfg)
     train_step_logger = _wandb_step_logger(wandb_run, "train")
     val_step_logger = _wandb_step_logger(wandb_run, "val")
-    mined_pool_size = 0
     try:
         for epoch in range(start_epoch, int(cfg["EPOCHS"]) + 1):
             train_metrics = run_epoch(
@@ -655,7 +583,7 @@ def main() -> None:
                 "train_loss": train_metrics["loss"],
                 "train_bce_loss": train_metrics["bce_loss"],
                 "train_dice_loss": train_metrics["dice_loss"],
-                "train_negative_empty_loss": train_metrics["negative_empty_loss"],
+                "train_dice": train_metrics["dice"],
                 "train_dice_micro": train_metrics["dice_micro"],
                 "train_dice_tumor": train_metrics["dice_tumor"],
                 "train_negative_specificity": train_metrics[
@@ -664,51 +592,34 @@ def main() -> None:
                 "val_loss": val_metrics["loss"],
                 "val_bce_loss": val_metrics["bce_loss"],
                 "val_dice_loss": val_metrics["dice_loss"],
-                "val_negative_empty_loss": val_metrics["negative_empty_loss"],
+                "val_dice": val_metrics["dice"],
                 "val_dice_micro": val_metrics["dice_micro"],
                 "val_dice_tumor": val_metrics["dice_tumor"],
                 "val_negative_specificity": val_metrics["negative_slice_specificity"],
-                "mined_hard_negative_pool_size": mined_pool_size,
             }
-            mine_this_epoch = (
-                mining_enabled
-                and epoch >= int(cfg["HARD_NEGATIVE_MINING_WARMUP_EPOCHS"])
-                and (
-                    (epoch - int(cfg["HARD_NEGATIVE_MINING_WARMUP_EPOCHS"]))
-                    % int(cfg["HARD_NEGATIVE_MINING_EVERY_N_EPOCHS"])
-                    == 0
-                )
-            )
-            if mine_this_epoch:
-                mined_indices = mine_false_positive_indices(
-                    model,
-                    mining_loader,
-                    mining_dataset,
-                    device,
-                    float(cfg["THRESHOLD"]),
-                    int(cfg["HARD_NEGATIVE_MINING_MAX_SLICES"]),
-                )
-                if train_batch_sampler is not None:
-                    train_batch_sampler.set_mined_hard_negative_indices(mined_indices)
-                mined_pool_size = len(mined_indices)
-                log["mined_hard_negative_pool_size"] = mined_pool_size
             print(log)
             if wandb_run is not None:
                 wandb_run.log(_wandb_finite_values(log))
-            should_stop = False
+            is_best_val_dice_micro = False
             val_dice_micro = val_metrics["dice_micro"]
             if (
                 np.isfinite(val_dice_micro)
                 and val_dice_micro > best_val_dice_micro
             ):
-                best_val_dice_micro, stale_epochs = val_dice_micro, 0
+                best_val_dice_micro = val_dice_micro
+                is_best_val_dice_micro = True
+
+            should_stop = False
+            val_loss = val_metrics["loss"]
+            if np.isfinite(val_loss) and val_loss < best_val_loss:
+                best_val_loss, stale_epochs = val_loss, 0
             else:
                 stale_epochs += 1
                 if stale_epochs >= int(cfg["EARLY_STOPPING_PATIENCE"]):
                     should_stop = True
                     print(
                         "Early stopping after "
-                        f"{stale_epochs} epochs without val_dice_micro improvement."
+                        f"{stale_epochs} epochs without val_loss improvement."
                     )
             scheduler.step()
             state = {
@@ -718,12 +629,13 @@ def main() -> None:
                 "scheduler_state": scheduler.state_dict(),
                 "scaler_state": scaler.state_dict() if scaler is not None else None,
                 "best_val_dice_micro": best_val_dice_micro,
+                "best_val_loss": best_val_loss,
                 "stale_epochs": stale_epochs,
                 "config": cfg,
                 "model_config": model_config,
             }
             save_checkpoint(experiment_dir / "last.pt", state)
-            if stale_epochs == 0:
+            if is_best_val_dice_micro:
                 save_checkpoint(experiment_dir / "best.pt", state)
             if should_stop:
                 break

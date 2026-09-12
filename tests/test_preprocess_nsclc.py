@@ -5,7 +5,6 @@ from pathlib import Path
 
 from scripts.preprocess_nsclc import (
     crop_and_resize,
-    build_parser,
     derive_lung_mask_from_ct,
     lung_crop_region,
     normalize_hu_to_uint8,
@@ -85,15 +84,6 @@ def test_write_case_outputs_replaces_an_existing_case_only_when_requested(tmp_pa
 
     output = np.asarray(Image.open(processed_root / "LUNG-001/images/0000.png"))
     assert output.tolist() == [[20, 20], [20, 20]]
-
-
-def test_build_parser_defaults_to_all_cases_and_default_roots():
-    """Catches a CLI that silently uses a subset, wrong root, or no chest margin."""
-    args = build_parser().parse_args([])
-    assert args.raw_root == Path(r"D:\NSCLC-Radiomics")
-    assert args.data_root == Path("data")
-    assert args.case is None
-    assert args.margin_mm == 25.0
 
 
 def test_sort_slice_positions_uses_image_orientation_not_filename_order():

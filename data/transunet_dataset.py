@@ -260,16 +260,6 @@ class PatientAwareBalancedBatchSampler(BatchSampler):
             raise ValueError(
                 f"cannot create balanced sampler; missing groups: {', '.join(missing)}"
             )
-        self.mined_hard_negative_indices: dict[str, list[int]] = {}
-
-    def set_mined_hard_negative_indices(self, indices: Sequence[int]) -> None:
-        """Use model-mined false positives for the hard-negative quota."""
-        by_case: dict[str, list[int]] = {}
-        for index in indices:
-            item = self.dataset.items[index]
-            if item.sample_group != "positive":
-                by_case.setdefault(item.case_id, []).append(index)
-        self.mined_hard_negative_indices = by_case
 
     def _counts(self) -> dict[str, int]:
         raw = {
@@ -290,15 +280,10 @@ class PatientAwareBalancedBatchSampler(BatchSampler):
         for _ in range(self.batches_per_epoch):
             batch: list[int] = []
             for group, count in counts.items():
-                pool = (
-                    self.mined_hard_negative_indices
-                    if group == "hard_negative" and self.mined_hard_negative_indices
-                    else self.indices[group]
-                )
-                patients = list(pool)
+                patients = list(self.indices[group])
                 for _ in range(count):
                     case_id = rng.choice(patients)
-                    batch.append(rng.choice(pool[case_id]))
+                    batch.append(rng.choice(self.indices[group][case_id]))
             rng.shuffle(batch)
             yield batch
 
@@ -320,7 +305,6 @@ class TumorCoveringBatchSampler(BatchSampler):
         batch_size: int,
         batches_per_epoch: int,
         seed: int = 42,
-        mined_hard_negative_fraction: float = 0.0,
     ) -> None:
         if batch_size < 1 or batches_per_epoch < 1:
             raise ValueError("batch_size and batches_per_epoch must be positive")
@@ -329,14 +313,11 @@ class TumorCoveringBatchSampler(BatchSampler):
             raise ValueError(
                 "TRAIN_BATCHES_PER_EPOCH cannot exceed the normal number of batches"
             )
-        if not 0.0 <= mined_hard_negative_fraction <= 1.0:
-            raise ValueError("mined_hard_negative_fraction must be in [0, 1]")
         self.dataset = dataset
         self.batch_size = batch_size
         self.batches_per_epoch = batches_per_epoch
         self.seed = seed
         self.epoch = 0
-        self.mined_hard_negative_fraction = mined_hard_negative_fraction
         self.positive_indices = [
             index
             for index, item in enumerate(dataset.items)
@@ -352,14 +333,6 @@ class TumorCoveringBatchSampler(BatchSampler):
             raise ValueError(
                 "TRAIN_BATCHES_PER_EPOCH is too small to include every positive slice"
             )
-        self.mined_hard_negative_indices: list[int] = []
-
-    def set_mined_hard_negative_indices(self, indices: Sequence[int]) -> None:
-        """Increase the sampling frequency of model false-positive negatives."""
-        allowed = set(self.negative_indices)
-        self.mined_hard_negative_indices = list(dict.fromkeys(
-            index for index in indices if index in allowed
-        ))
 
     def __iter__(self):
         rng = random.Random(self.seed + self.epoch)
@@ -375,18 +348,9 @@ class TumorCoveringBatchSampler(BatchSampler):
         for position, index in zip(positions, positives):
             selected[position] = index
         remaining_positions = positions[len(positives) :]
-        mined_count = min(
-            len(remaining_positions),
-            round(len(remaining_positions) * self.mined_hard_negative_fraction),
-        )
-        if self.mined_hard_negative_indices and mined_count:
-            for position in remaining_positions[:mined_count]:
-                selected[position] = rng.choice(self.mined_hard_negative_indices)
-        else:
-            mined_count = 0
         used = {index for index in selected if index is not None}
         remaining = iter([index for index in negatives if index not in used])
-        for position in remaining_positions[mined_count:]:
+        for position in remaining_positions:
             selected[position] = next(remaining)
 
         indices = [index for index in selected if index is not None]
