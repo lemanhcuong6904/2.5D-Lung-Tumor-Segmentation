@@ -36,14 +36,20 @@ data/processed/
 data/nifti/
 data/nsclc-radiomics/processed/
 data/nsclc-radiomics/nifti/
+data/nsclc-radiomics/intermediate/
 data/nsclc-radiomics/processing_report.csv
-data/nsclc-radiomics/nsclc_radiogenomics/processed/
-data/nsclc-radiomics/nsclc_radiogenomics/nifti/
-data/nsclc-radiomics/nsclc_radiogenomics/intermediate/
-data/nsclc-radiomics/nsclc_radiogenomics/reports/
-data/nsclc-radiomics/nsclc_radiogenomics/processing_report.csv
+data/nsclc_radiogenomics/processed/
+data/nsclc_radiogenomics/nifti/
+data/nsclc_radiogenomics/intermediate/
+data/nsclc_radiogenomics/processing_report.csv
 
 # Model exports and temporary files
 *.onnx
+*.nii.gz
 *.tmp
 *.temp
+
+# Local analysis and visualization utilities (not part of the public release)
+inferences/sweep_thresholds_nsclc_radiomics.py
+inferences/visualize_2d_25d_improvements.py
+inferences/visualize_postprocessing_pyqt6.py

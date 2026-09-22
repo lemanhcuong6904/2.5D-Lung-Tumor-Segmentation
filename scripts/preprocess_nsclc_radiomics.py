@@ -16,9 +16,12 @@ DATASET_ROOT = Path("data/nsclc-radiomics")
 # Set to ``None`` to process every case, or e.g. ``["LUNG1-001"]``.
 CASE_IDS: list[str] | None = None
 MARGIN_MM = 15.0
+# True: crop to the lung bbox along Z (with no Z margin). False: retain every
+# source Z slice and crop/margin only in the XY plane.
+CROP_Z_TO_LUNG_BBOX = False
 HU_WINDOW_LOW = -700
 HU_WINDOW_HIGH = 500
-OVERWRITE = False
+OVERWRITE = True
 DRY_RUN = False
 
 
@@ -44,6 +47,7 @@ def main() -> int:
                 DRY_RUN,
                 HU_WINDOW_LOW,
                 HU_WINDOW_HIGH,
+                CROP_Z_TO_LUNG_BBOX,
             )
         except Exception as error:
             row = {

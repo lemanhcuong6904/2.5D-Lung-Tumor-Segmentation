@@ -24,7 +24,7 @@ from data.transunet_dataset import (
     build_train_transform,
     read_case_ids,
 )
-from trains.train_transunet import CFG as TRAIN_CFG
+from trains.train_nsclc_radiomics import CFG as TRAIN_CFG
 
 CFG = {
     "OUTPUT_PATH": str(ROOT_DIR / "output" / "debug" / "train_loader_batch_preview.png"),

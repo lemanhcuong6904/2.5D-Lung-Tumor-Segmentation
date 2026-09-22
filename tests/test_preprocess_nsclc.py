@@ -27,14 +27,14 @@ def test_normalize_hu_clips_and_scales_to_uint8():
     )
 
 
-def test_lung_crop_region_squares_xy_before_applying_margin():
-    """Catches applying margin before the per-case in-plane square expansion."""
+def test_lung_crop_region_squares_xy_and_keeps_z_extent_without_margin():
+    """The requested context margin expands XY only, never the Z range."""
     array = np.zeros((4, 12, 12), dtype=np.uint8)
     array[1:3, 3:8, 2:10] = 1
     lung = sitk.GetImageFromArray(array)
     lung.SetSpacing((2.0, 2.0, 3.0))
 
-    assert lung_crop_region(lung, margin_mm=2.0) == ((1, 1, 0), (10, 10, 4))
+    assert lung_crop_region(lung, margin_mm=2.0) == ((1, 1, 1), (10, 10, 2))
 
 
 def test_crop_and_resize_preserves_z_and_physical_extent():

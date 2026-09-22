@@ -1,4 +1,4 @@
-"""Config-only supervised training for 2D and 2.5D TransUNet experiments."""
+"""Config-only supervised training for NSCLC-Radiogenomics TransUNet experiments."""
 
 from __future__ import annotations
 
@@ -45,13 +45,13 @@ from utils.training import (
 )
 
 CFG: dict[str, Any] = {
-    "EXP_NAME": "transunet_2.5d-5_balanced_sampling",
-    # Switch this complete group to data/nsclc-radiomics/nsclc_radiogenomics to train on the
-    # TotalSegmentator-labelled cohort; never mix dataset roots accidentally.
-    "PROCESSED_ROOT": str(ROOT_DIR / "data" / "nsclc-radiomics" / "processed"),
-    "NIFTI_ROOT": str(ROOT_DIR / "data" / "nsclc-radiomics" / "nifti"),
-    "TRAIN_SPLIT": str(ROOT_DIR / "data" / "nsclc-radiomics" / "config" / "train.txt"),
-    "VAL_SPLIT": str(ROOT_DIR / "data" / "nsclc-radiomics" / "config" / "val.txt"),
+    "EXP_NAME": "nsclc_radiogenomics_2.5d-5_final_fullZ",
+    "PROCESSED_ROOT": str(ROOT_DIR / "data" / "nsclc_radiogenomics" / "processed"),
+    "NIFTI_ROOT": str(ROOT_DIR / "data" / "nsclc_radiogenomics" / "nifti"),
+    "TRAIN_SPLIT": str(
+        ROOT_DIR / "data" / "nsclc_radiogenomics" / "config" / "train.txt"
+    ),
+    "VAL_SPLIT": str(ROOT_DIR / "data" / "nsclc_radiogenomics" / "config" / "test.txt"),
     "SAVE_ROOT": str(ROOT_DIR / "experiments"),
     "NUM_SLICES": 5,
     "IMAGE_SIZE": 256,
@@ -70,12 +70,12 @@ CFG: dict[str, Any] = {
     # True: patient-aware positive/hard/easy-negative sampling. False: use
     # the natural slice distribution (optionally with the epoch limit below).
     "BALANCED_TRAIN_SAMPLING": True,
-    "POSITIVE_FRACTION": 0.4,
+    "POSITIVE_FRACTION": 0.35,
     "HARD_NEGATIVE_FRACTION": 0.2,
-    "EASY_NEGATIVE_FRACTION": 0.4,
+    "EASY_NEGATIVE_FRACTION": 0.45,
     # None: use every training slice once per epoch. Set an integer limit to
     # include every tumor slice while randomly subsampling negative slices.
-    "TRAIN_BATCHES_PER_EPOCH": 800,
+    "TRAIN_BATCHES_PER_EPOCH": 500,
     "SAMPLER_SEED": 42,
     "NUM_WORKERS": 0,
     "PIN_MEMORY": True,
@@ -88,15 +88,23 @@ CFG: dict[str, Any] = {
     # Total loss = BCEWithLogitsLoss + DICE_LOSS_WEIGHT * weighted Dice loss.
     "DICE_LOSS_WEIGHT": 1.0,
     "DICE_BACKGROUND_WEIGHT": 1.0,
-    "DICE_FOREGROUND_WEIGHT": 1.0,
+    "DICE_FOREGROUND_WEIGHT": 1.2,
     "DICE_SMOOTH": 1e-6,
     "AMP": True,
     "THRESHOLD": 0.5,
     "EARLY_STOPPING_PATIENCE": 7,
+    "CHECKPOINT_METRIC": "val_case_dice_3d_tumor",
+    "EARLY_STOPPING_METRIC": "val_case_dice_3d_tumor",
     "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
     "WANDB_ENABLED": True,
     "WANDB_PROJECT": "lung-tumor-transunet",
-    "RESUME_PATH": r"experiments\transunet_2.5d-5_balanced_sampling\best.pt",# Old ResNet-50 checkpoints are incompatible; train this architecture from scratch.
+    # Leave empty for a fresh Radiogenomics run. Set it to a checkpoint from
+    # this same experiment only when intentionally resuming.
+    "RESUME_PATH": r"experiments\nsclc_radiogenomics_2.5d-5_final\best.pt",
+    # False: resume model, optimizer, LR scheduler, AMP scaler, epoch, and
+    # early-stopping state. True: load only model weights and restart at epoch
+    # 1 with the LR schedule and early-stopping patience from this config.
+    "RESUME_WEIGHTS_ONLY": False,
     "SEED": 42,
 }
 
@@ -171,9 +179,7 @@ class BCEWeightedDiceLoss(torch.nn.Module):
         valid_classes = class_targets.sum(dim=reduce_dims) > 0
         weights = self.dice_class_weights.to(dtype=class_dice.dtype)
         weighted_dice = (class_dice * valid_classes * weights).sum() / (
-            (valid_classes * weights)
-            .sum()
-            .clamp_min(torch.finfo(class_dice.dtype).eps)
+            (valid_classes * weights).sum().clamp_min(torch.finfo(class_dice.dtype).eps)
         )
         dice_loss = 1.0 - weighted_dice
         total_loss = bce_loss + self.dice_weight * dice_loss
@@ -195,7 +201,7 @@ def build_loss(cfg: dict[str, Any], device: torch.device) -> BCEWeightedDiceLoss
 def _summarize_predictions(
     records: list[SlicePrediction], compute_volume_metrics: bool = True
 ) -> dict[str, float]:
-    """Aggregate macro slice Dice alongside pixel-level micro Dice."""
+    """Aggregate slice metrics and, when requested, per-case 3D tumor Dice."""
     if not records:
         raise ValueError("cannot summarize an empty prediction collection")
     slice_rows = [
@@ -244,15 +250,30 @@ def _summarize_predictions(
         ),
     }
     if not compute_volume_metrics:
-        return summary | {"dice_3d": float("nan"), "iou_3d": float("nan")}
+        return summary | {
+            "dice_3d": float("nan"),
+            "iou_3d": float("nan"),
+            "case_dice_3d_tumor": float("nan"),
+        }
     volumes = aggregate_case_predictions(records)
     volume_rows = [
-        binary_volume_metrics(value["prediction"], value["target"], (1.0, 1.0, 1.0))
+        (
+            value,
+            binary_volume_metrics(
+                value["prediction"], value["target"], (1.0, 1.0, 1.0)
+            ),
+        )
         for value in volumes.values()
     ]
     return summary | {
-        "dice_3d": finite_mean([float(row["dice"]) for row in volume_rows]),
-        "iou_3d": finite_mean([float(row["iou"]) for row in volume_rows]),
+        "dice_3d": finite_mean([float(row["dice"]) for _, row in volume_rows]),
+        "iou_3d": finite_mean([float(row["iou"]) for _, row in volume_rows]),
+        # One 3D Dice per case, restricted to cases whose ground truth contains
+        # tumor. A missed tumor therefore contributes 0, while empty cases do
+        # not inflate the validation score.
+        "case_dice_3d_tumor": finite_mean(
+            [float(row["dice"]) for value, row in volume_rows if value["target"].any()]
+        ),
     }
 
 
@@ -416,15 +437,15 @@ def restore_training_state(
     scheduler: LambdaLR,
     scaler: torch.amp.GradScaler | None,
     device: torch.device,
+    early_stopping_metric: str | None = None,
 ) -> tuple[int, float, float, int]:
-    """Restore state, returning epoch, best Dice, best loss, and patience."""
+    """Restore state, resetting patience if its tracked metric changed."""
     checkpoint = load_checkpoint(Path(checkpoint_path), device)
     required = {
         "epoch",
         "model_state",
         "optimizer_state",
         "scheduler_state",
-        "best_val_dice_micro",
     }
     missing = sorted(required - checkpoint.keys())
     if missing:
@@ -436,15 +457,38 @@ def restore_training_state(
         scaler.load_state_dict(checkpoint["scaler_state"])
     return (
         int(checkpoint["epoch"]) + 1,
-        float(checkpoint["best_val_dice_micro"]),
+        float(checkpoint.get("best_val_case_dice_3d_tumor", float("-inf"))),
         float(checkpoint.get("best_val_loss", float("inf"))),
-        int(checkpoint.get("stale_epochs", 0)),
+        (
+            int(checkpoint.get("stale_epochs", 0))
+            if checkpoint.get("early_stopping_metric") == early_stopping_metric
+            else 0
+        ),
     )
 
 
-def main() -> None:
+def load_model_weights_only(
+    checkpoint_path: Path, model: torch.nn.Module, device: torch.device
+) -> int | None:
+    """Load model parameters only, intentionally discarding all run state."""
+    checkpoint = load_checkpoint(Path(checkpoint_path), device)
+    if "model_state" not in checkpoint:
+        raise KeyError("weights-only checkpoint is missing key: model_state")
+    model.load_state_dict(checkpoint["model_state"])
+    return int(checkpoint["epoch"]) if "epoch" in checkpoint else None
+
+
+def main(config: dict[str, Any] | None = None) -> None:
     """Train with the constants declared in CFG; no command-line interface is used."""
-    cfg = dict(CFG)
+    cfg = dict(CFG if config is None else config)
+    expected_metric = "val_case_dice_3d_tumor"
+    if (
+        cfg["CHECKPOINT_METRIC"] != expected_metric
+        or cfg["EARLY_STOPPING_METRIC"] != expected_metric
+    ):
+        raise ValueError(
+            "checkpoint selection and early stopping must use " f"'{expected_metric}'"
+        )
     seed_everything(int(cfg["SEED"]))
     device = torch.device(str(cfg["DEVICE"]))
     experiment_dir = Path(cfg["SAVE_ROOT"]) / str(cfg["EXP_NAME"])
@@ -526,7 +570,7 @@ def main() -> None:
     )
     use_amp = bool(cfg["AMP"]) and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
-    start_epoch, best_val_dice_micro, best_val_loss, stale_epochs = (
+    start_epoch, best_val_case_dice_3d_tumor, best_val_loss, stale_epochs = (
         1,
         float("-inf"),
         float("inf"),
@@ -534,20 +578,35 @@ def main() -> None:
     )
     resume_path = str(cfg["RESUME_PATH"]).strip()
     if resume_path:
-        (
-            start_epoch,
-            best_val_dice_micro,
-            best_val_loss,
-            stale_epochs,
-        ) = restore_training_state(
-            Path(resume_path), model, optimizer, scheduler, scaler, device
-        )
-        print(
-            f"[RESUME] checkpoint={resume_path} start_epoch={start_epoch} "
-            f"best_val_dice_micro={best_val_dice_micro:.6f} "
-            f"best_val_loss={best_val_loss:.6f} "
-            f"stale_epochs={stale_epochs}"
-        )
+        if bool(cfg.get("RESUME_WEIGHTS_ONLY", False)):
+            source_epoch = load_model_weights_only(Path(resume_path), model, device)
+            print(
+                f"[WEIGHTS-ONLY] checkpoint={resume_path} source_epoch={source_epoch} "
+                f"start_epoch={start_epoch} lr={optimizer.param_groups[0]['lr']:.8g} "
+                "optimizer/scheduler/scaler/early-stopping state reset"
+            )
+        else:
+            (
+                start_epoch,
+                best_val_case_dice_3d_tumor,
+                best_val_loss,
+                stale_epochs,
+            ) = restore_training_state(
+                Path(resume_path),
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                device,
+                early_stopping_metric=str(cfg["EARLY_STOPPING_METRIC"]),
+            )
+            print(
+                f"[RESUME] checkpoint={resume_path} start_epoch={start_epoch} "
+                "best_val_case_dice_3d_tumor="
+                f"{best_val_case_dice_3d_tumor:.6f} "
+                f"best_val_loss={best_val_loss:.6f} "
+                f"stale_epochs={stale_epochs}"
+            )
     wandb_run = _wandb_run(cfg)
     train_step_logger = _wandb_step_logger(wandb_run, "train")
     val_step_logger = _wandb_step_logger(wandb_run, "val")
@@ -575,7 +634,7 @@ def main() -> None:
                 float(cfg["THRESHOLD"]),
                 f"Epoch {epoch}/{cfg['EPOCHS']} | val",
                 step_logger=val_step_logger,
-                compute_volume_metrics=False,
+                compute_volume_metrics=True,
             )
             log = {
                 "epoch": epoch,
@@ -595,31 +654,35 @@ def main() -> None:
                 "val_dice": val_metrics["dice"],
                 "val_dice_micro": val_metrics["dice_micro"],
                 "val_dice_tumor": val_metrics["dice_tumor"],
+                "val_case_dice_3d_tumor": val_metrics["case_dice_3d_tumor"],
                 "val_negative_specificity": val_metrics["negative_slice_specificity"],
             }
             print(log)
             if wandb_run is not None:
                 wandb_run.log(_wandb_finite_values(log))
-            is_best_val_dice_micro = False
-            val_dice_micro = val_metrics["dice_micro"]
+            is_best_val_case_dice_3d_tumor = False
+            val_case_dice_3d_tumor = val_metrics["case_dice_3d_tumor"]
             if (
-                np.isfinite(val_dice_micro)
-                and val_dice_micro > best_val_dice_micro
+                np.isfinite(val_case_dice_3d_tumor)
+                and val_case_dice_3d_tumor > best_val_case_dice_3d_tumor
             ):
-                best_val_dice_micro = val_dice_micro
-                is_best_val_dice_micro = True
+                best_val_case_dice_3d_tumor = val_case_dice_3d_tumor
+                is_best_val_case_dice_3d_tumor = True
 
             should_stop = False
             val_loss = val_metrics["loss"]
             if np.isfinite(val_loss) and val_loss < best_val_loss:
-                best_val_loss, stale_epochs = val_loss, 0
+                best_val_loss = val_loss
+            if is_best_val_case_dice_3d_tumor:
+                stale_epochs = 0
             else:
                 stale_epochs += 1
                 if stale_epochs >= int(cfg["EARLY_STOPPING_PATIENCE"]):
                     should_stop = True
                     print(
                         "Early stopping after "
-                        f"{stale_epochs} epochs without val_loss improvement."
+                        f"{stale_epochs} epochs without "
+                        "val_case_dice_3d_tumor improvement."
                     )
             scheduler.step()
             state = {
@@ -628,14 +691,15 @@ def main() -> None:
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
                 "scaler_state": scaler.state_dict() if scaler is not None else None,
-                "best_val_dice_micro": best_val_dice_micro,
+                "best_val_case_dice_3d_tumor": best_val_case_dice_3d_tumor,
                 "best_val_loss": best_val_loss,
                 "stale_epochs": stale_epochs,
+                "early_stopping_metric": cfg["EARLY_STOPPING_METRIC"],
                 "config": cfg,
                 "model_config": model_config,
             }
             save_checkpoint(experiment_dir / "last.pt", state)
-            if is_best_val_dice_micro:
+            if is_best_val_case_dice_3d_tumor:
                 save_checkpoint(experiment_dir / "best.pt", state)
             if should_stop:
                 break

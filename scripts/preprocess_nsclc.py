@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import csv
 import shutil
-import subprocess
+import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -25,7 +26,10 @@ from PIL import Image, ImageDraw
 # such as ["LUNG1-001", "LUNG1-002"].
 HU_WINDOW_LOW = -700
 HU_WINDOW_HIGH = 500
-TOTALSEGMENTATOR_TASK = "total"
+# The TotalSegmentator ``total`` task is split into five nnU-Net models.
+# Task 291 is the only part containing the five lung lobes used here.
+TOTALSEGMENTATOR_LUNG_TASK_ID = 291
+TOTALSEGMENTATOR_FAST_TASK_ID = 297
 
 # Source DICOM SEG labels. Lung is used only to define the crop; the saved
 # label contains tumor only, binarized to 0/1.
@@ -57,9 +61,17 @@ def normalize_hu_to_uint8(
 
 
 def lung_crop_region(
-    lung_mask: sitk.Image, margin_px: int = 0, *, margin_mm: float | None = None
+    lung_mask: sitk.Image,
+    margin_px: int = 0,
+    *,
+    margin_mm: float | None = None,
+    crop_z_to_lung_bbox: bool = True,
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    """Return the per-case lung bbox, expanded by a voxel/pixel margin."""
+    """Return a square XY lung bbox, with optional Z-bbox cropping.
+
+    The margin is always in-plane only. With ``crop_z_to_lung_bbox=False``,
+    the returned region retains every source CT slice along Z.
+    """
     if margin_mm is not None:
         if margin_mm < 0:
             raise ValueError("margin_mm must be non-negative")
@@ -88,11 +100,17 @@ def lung_crop_region(
         index[axis] = start
         size[axis] = square_side
 
-    for axis in range(3):
+    # Preserve the lung-mask Z extent exactly.  Margin is deliberately an
+    # in-plane context margin, not an extension to superior/inferior slices.
+    for axis in (0, 1):
         start = max(0, index[axis] - margin_px)
         stop = min(image_size[axis], index[axis] + size[axis] + margin_px)
         index[axis] = start
         size[axis] = stop - start
+
+    if not crop_z_to_lung_bbox:
+        index[2] = 0
+        size[2] = image_size[2]
 
     return tuple(index), tuple(size)
 
@@ -101,16 +119,34 @@ def crop_and_resize(
     image: sitk.Image,
     region: tuple[tuple[int, int, int], tuple[int, int, int]],
     is_label: bool,
+    *,
+    output_z_spacing_mm: float | None = None,
 ) -> sitk.Image:
-    """Crop an image then resize only XY to 256 pixels, retaining Z."""
+    """Crop an image, resize XY to 256 pixels, and optionally resample Z."""
     index, size = region
     cropped = sitk.RegionOfInterest(image, size=list(size), index=list(index))
-    output_size = (256, 256, size[2])
     input_spacing = cropped.GetSpacing()
+    if output_z_spacing_mm is not None and output_z_spacing_mm <= 0:
+        raise ValueError("output_z_spacing_mm must be positive when provided")
+
+    # Use the physical distance between the first and last slice centres so
+    # the resampled volume covers the cropped Z extent without silently
+    # truncating its superior or inferior end.  The requested spacing remains
+    # exact; a small endpoint difference is unavoidable for discrete voxels.
+    output_z_size = size[2]
+    output_z_spacing = input_spacing[2]
+    if output_z_spacing_mm is not None:
+        output_z_spacing = float(output_z_spacing_mm)
+        output_z_size = max(
+            1,
+            int(round((size[2] - 1) * input_spacing[2] / output_z_spacing)) + 1,
+        )
+
+    output_size = (256, 256, output_z_size)
     output_spacing = (
         input_spacing[0] * size[0] / output_size[0],
         input_spacing[1] * size[1] / output_size[1],
-        input_spacing[2],
+        output_z_spacing,
     )
 
     resampler = sitk.ResampleImageFilter()
@@ -171,12 +207,12 @@ def write_case_outputs(
             sitk.Cast(mask > 0, sitk.sitkUInt8), str(tmp_nifti / "mask.nii.gz")
         )
         if final_processed.exists():
-            final_processed.replace(backup_processed)
+            _replace_path_with_retry(final_processed, backup_processed)
         if final_nifti.exists():
-            final_nifti.replace(backup_nifti)
-        tmp_processed.replace(final_processed)
+            _replace_path_with_retry(final_nifti, backup_nifti)
+        _replace_path_with_retry(tmp_processed, final_processed)
         processed_replaced = True
-        tmp_nifti.replace(final_nifti)
+        _replace_path_with_retry(tmp_nifti, final_nifti)
         nifti_replaced = True
         shutil.rmtree(backup_processed, ignore_errors=True)
         shutil.rmtree(backup_nifti, ignore_errors=True)
@@ -192,6 +228,27 @@ def write_case_outputs(
         shutil.rmtree(tmp_processed, ignore_errors=True)
         shutil.rmtree(tmp_nifti, ignore_errors=True)
         raise
+
+
+def _replace_path_with_retry(
+    source: Path, destination: Path, *, attempts: int = 5, delay_seconds: float = 2.0
+) -> None:
+    """Rename an output path, retrying transient Windows access/share locks."""
+    for attempt in range(1, attempts + 1):
+        try:
+            source.replace(destination)
+            return
+        except PermissionError as error:
+            # WinError 5 is ``Access is denied`` and 32 is a sharing violation.
+            # Both are commonly caused by Explorer, an image viewer, antivirus,
+            # or another Python process briefly inspecting a just-written file.
+            if getattr(error, "winerror", None) not in {5, 32} or attempt == attempts:
+                raise
+            print(
+                f"Windows is temporarily locking {source.name}; retrying output "
+                f"replacement ({attempt}/{attempts})..."
+            )
+            time.sleep(delay_seconds)
 
 
 def _dicom_headers(case_dir: Path) -> Iterable[tuple[Path, pydicom.Dataset]]:
@@ -378,6 +435,85 @@ def remove_small_lung_components(
     return cleaned, len(statistics.GetLabels()) - len(kept_labels)
 
 
+def clean_tumor_mask(
+    tumor_mask: sitk.Image,
+    *,
+    closing_radius_mm: float = 0.0,
+    fill_holes: bool = True,
+    keep_largest_component: bool = True,
+    minimum_component_voxels: int = 0,
+    dilation_radius_mm: float = 0.0,
+) -> tuple[sitk.Image, dict[str, int]]:
+    """Conservatively clean a binary tumour mask on its native CT grid.
+
+    Every radius is converted independently along X/Y/Z, so the morphology
+    remains in physical millimetres for anisotropic CT spacing.  Dilation is
+    deliberately the final operation: only the retained lesion is allowed to
+    grow or merge with another structure.
+    """
+    if closing_radius_mm < 0 or dilation_radius_mm < 0:
+        raise ValueError("tumour morphology radii must be non-negative")
+    if minimum_component_voxels < 0:
+        raise ValueError("minimum_component_voxels must be non-negative")
+    cleaned = sitk.Cast(tumor_mask > 0, sitk.sitkUInt8)
+    original_voxels = int(sitk.GetArrayViewFromImage(cleaned).sum())
+    spacing = cleaned.GetSpacing()
+
+    def physical_radius(radius_mm: float) -> list[int]:
+        return [int(np.ceil(radius_mm / axis_spacing)) for axis_spacing in spacing]
+
+    if closing_radius_mm > 0:
+        cleaned = sitk.BinaryMorphologicalClosing(
+            cleaned,
+            kernelRadius=physical_radius(closing_radius_mm),
+            kernelType=sitk.sitkBall,
+        )
+    if fill_holes:
+        cleaned = sitk.BinaryFillhole(cleaned, fullyConnected=True)
+
+    component_filter = sitk.ConnectedComponentImageFilter()
+    component_filter.FullyConnectedOn()
+    connected = component_filter.Execute(cleaned)
+    statistics = sitk.LabelShapeStatisticsImageFilter()
+    statistics.Execute(connected)
+    component_count_before = len(statistics.GetLabels())
+    if keep_largest_component and statistics.GetLabels():
+        kept_labels = [
+            max(statistics.GetLabels(), key=statistics.GetNumberOfPixels)
+        ]
+    elif minimum_component_voxels:
+        kept_labels = [
+            label
+            for label in statistics.GetLabels()
+            if statistics.GetNumberOfPixels(label) >= minimum_component_voxels
+        ]
+    else:
+        kept_labels = list(statistics.GetLabels())
+
+    if len(kept_labels) != component_count_before:
+        array = np.isin(
+            sitk.GetArrayViewFromImage(connected), kept_labels
+        ).astype(np.uint8)
+        cleaned = sitk.GetImageFromArray(array)
+        cleaned.CopyInformation(tumor_mask)
+
+    if dilation_radius_mm > 0 and kept_labels:
+        cleaned = sitk.BinaryDilate(
+            cleaned,
+            kernelRadius=physical_radius(dilation_radius_mm),
+            kernelType=sitk.sitkBall,
+        )
+    cleaned = sitk.Cast(cleaned > 0, sitk.sitkUInt8)
+    return cleaned, {
+        "tumor_original_voxels": original_voxels,
+        "tumor_cleaned_voxels": int(sitk.GetArrayViewFromImage(cleaned).sum()),
+        "tumor_components_before_cleanup": component_count_before,
+        "tumor_components_removed": component_count_before - len(kept_labels),
+        "tumor_kept_largest_component": int(keep_largest_component),
+        "tumor_min_component_voxels": minimum_component_voxels,
+    }
+
+
 def _decode_rtstruct_tumor_to_ct(
     rtstruct_path: Path, ct_image: sitk.Image
 ) -> tuple[sitk.Image, list[str]]:
@@ -478,47 +614,129 @@ def _read_totalsegmentator_lung_mask(
     output.CopyInformation(reference)
     return output
 
+
+def _load_lung_mask(path: Path, reference: sitk.Image) -> sitk.Image:
+    """Load a persisted binary lung mask and align it to the CT grid."""
+    mask = sitk.ReadImage(str(path))
+    if mask.GetSize() != reference.GetSize() or not np.allclose(
+        mask.GetSpacing(), reference.GetSpacing()
+    ):
+        mask = sitk.Resample(
+            mask,
+            reference,
+            sitk.Transform(),
+            sitk.sitkNearestNeighbor,
+            0,
+            sitk.sitkUInt8,
+        )
+    output = sitk.Cast(mask > 0, sitk.sitkUInt8)
+    output.CopyInformation(reference)
+    return output
+
+
+def _totalsegmentator_api_device(device: str | None) -> str:
+    """Translate the former CLI device spelling to the Python API spelling."""
+    normalized = (device or "cuda").casefold()
+    aliases = {"gpu": "cuda", "cuda": "cuda", "cpu": "cpu", "mps": "mps"}
+    if normalized not in aliases:
+        raise ValueError(
+            "TotalSegmentator device must be one of: cuda, cpu, mps "
+            "(gpu is accepted as an alias for cuda)."
+        )
+    return aliases[normalized]
+
+
+def _is_windows_file_lock(error: PermissionError) -> bool:
+    """Return whether Windows reports a transient file-sharing violation."""
+    return getattr(error, "winerror", None) == 32
+
+
 def segment_lung_with_totalsegmentator(
     ct_hu_clipped: sitk.Image,
     case_id: str,
     staging_root: Path,
-    executable: str = "TotalSegmentator",
-    task: str = TOTALSEGMENTATOR_TASK,
+    task_id: int = TOTALSEGMENTATOR_LUNG_TASK_ID,
+    trainer: str = "nnUNetTrainerNoMirroring",
+    resample_mm: float = 1.5,
     device: str | None = None,
     overwrite: bool = False,
     lung_rois: Sequence[str] | None = None,
 ) -> tuple[sitk.Image, Path, Path]:
     """Persist a HU NIfTI and create/load a TotalSegmentator lung mask.
 
-    The external model is intentionally invoked through its CLI. This keeps
-    preprocessing importable on machines that only need Radiomics and avoids
-    downloading model weights until a Radiogenomics case is actually run.
+    This directly invokes the Task 291 nnU-Net model through TotalSegmentator's
+    installed Python API.  The standard ``TotalSegmentator --task total`` CLI
+    downloads all five total-body task weights before applying ``--roi_subset``;
+    direct Task 291 inference downloads only the organs/lung-lobes weights.
     """
     case_root = staging_root / case_id
     input_path = case_root / "ct_hu_clipped.nii.gz"
     output_dir = case_root / "totalsegmentator"
+    combined_mask_path = output_dir / "lung_mask.nii.gz"
     if overwrite and output_dir.exists():
         shutil.rmtree(output_dir)
     case_root.mkdir(parents=True, exist_ok=True)
     if overwrite or not input_path.exists():
         sitk.WriteImage(ct_hu_clipped, str(input_path))
-    if not output_dir.exists() or not any(output_dir.glob("*.nii*")):
-        output_dir.mkdir(parents=True, exist_ok=True)
-        command = [executable, "-i", str(input_path), "-o", str(output_dir), "--task", task]
-        if lung_rois:
-            command.extend(["--roi_subset", *lung_rois])
-        if device:
-            command.extend(["--device", device])
-        try:
-            subprocess.run(command, check=True)
-        except FileNotFoundError as error:
-            raise RuntimeError(
-                "TotalSegmentator was not found. Install it with `pip install TotalSegmentator` "
-                "and ensure its CLI is on PATH, or pass --totalsegmentator-bin."
-            ) from error
-        except subprocess.CalledProcessError as error:
-            raise RuntimeError(f"TotalSegmentator failed for {case_id} (exit {error.returncode})") from error
-    return _read_totalsegmentator_lung_mask(output_dir, ct_hu_clipped), input_path, output_dir
+    if combined_mask_path.exists() and not overwrite:
+        return _load_lung_mask(combined_mask_path, ct_hu_clipped), input_path, output_dir
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # Remove a legacy persistent multilabel output from earlier script versions.
+    legacy_lobes_path = output_dir / "lung_lobes.nii.gz"
+    if legacy_lobes_path.exists():
+        legacy_lobes_path.unlink()
+    try:
+        from totalsegmentator.config import setup_nnunet
+        from totalsegmentator.libs import download_pretrained_weights
+
+        # The public TotalSegmentator API calls this itself.  We invoke
+        # nnUNet directly to restrict execution to Task 291, therefore
+        # initialise its results path explicitly before importing nnunet.
+        setup_nnunet()
+        from totalsegmentator.nnunet import nnUNet_predict_image
+    except ImportError as error:
+        raise RuntimeError(
+            "TotalSegmentator was not found. Install it with `pip install TotalSegmentator`."
+        ) from error
+    download_pretrained_weights(task_id)
+    # nnUNet writes its multilabel lobe prediction only to this temporary
+    # directory.  The only persistent model result is the binary union below.
+    with tempfile.TemporaryDirectory(
+        prefix=".lung_lobes_", dir=output_dir, ignore_cleanup_errors=True
+    ) as temp_dir:
+        temporary_output = Path(temp_dir) / "lung_lobes.nii.gz"
+        for attempt in range(1, 4):
+            try:
+                nnUNet_predict_image(
+                    input_path,
+                    temporary_output,
+                    task_id,
+                    model="3d_fullres",
+                    folds=[0],
+            trainer=trainer,
+                    tta=False,
+                    multilabel_image=True,
+            resample=resample_mm,
+                    task_name="total",
+                    roi_subset=list(lung_rois or LUNG_SEGMENT_LABELS),
+                    device=_totalsegmentator_api_device(device),
+                    quiet=False,
+                )
+                break
+            except PermissionError as error:
+                if not _is_windows_file_lock(error) or attempt == 3:
+                    raise
+                print(
+                    f"{case_id}: Windows is temporarily locking nnU-Net files; "
+                    f"retrying Task {task_id} ({attempt}/3)..."
+                )
+                time.sleep(2)
+        lung_mask = _read_totalsegmentator_lung_mask(Path(temp_dir), ct_hu_clipped)
+        # Persist before the temporary lobe output is cleaned up. Downstream
+        # cropping consumes this binary union, never the lobe labels.
+        sitk.WriteImage(lung_mask, str(combined_mask_path))
+    return lung_mask, input_path, output_dir
 
 
 def process_case(
@@ -530,6 +748,7 @@ def process_case(
     dry_run: bool = False,
     hu_window_low: int = HU_WINDOW_LOW,
     hu_window_high: int = HU_WINDOW_HIGH,
+    crop_z_to_lung_bbox: bool = True,
 ) -> dict[str, str]:
     case_id = output_case_id(case_dir.name)
     result = {
@@ -582,7 +801,9 @@ def process_case(
         tumor_mask, selected_tumor_labels = _decode_rtstruct_tumor_to_ct(
             rtstruct_path, ct_image
         )
-    region = lung_crop_region(lung_mask, margin_mm=margin_mm)
+    region = lung_crop_region(
+        lung_mask, margin_mm=margin_mm, crop_z_to_lung_bbox=crop_z_to_lung_bbox
+    )
     image_final = crop_and_resize(
         _normalize_ct_image(ct_image, hu_window_low, hu_window_high),
         region,
@@ -598,6 +819,7 @@ def process_case(
         tumor_labels=";".join(selected_tumor_labels),
         crop_index=str(region[0]),
         crop_size=str(region[1]),
+        crop_z_to_lung_bbox=str(crop_z_to_lung_bbox),
         final_size=str(image_final.GetSize()),
         final_spacing=str(image_final.GetSpacing()),
     )
@@ -620,15 +842,24 @@ def process_radiogenomics_case(
     staging_root: Path,
     margin_mm: float,
     overwrite: bool,
-    totalsegmentator_bin: str,
-    totalsegmentator_task: str,
+    totalsegmentator_task_id: int,
     totalsegmentator_device: str | None,
     dry_run: bool = False,
     hu_window_low: int = HU_WINDOW_LOW,
     hu_window_high: int = HU_WINDOW_HIGH,
     totalsegmentator_lung_rois: Sequence[str] | None = None,
+    totalsegmentator_trainer: str = "nnUNetTrainerNoMirroring",
+    totalsegmentator_resample_mm: float = 1.5,
+    output_z_spacing_mm: float | None = None,
+    reuse_existing_lung_mask: bool = True,
+    tumor_closing_radius_mm: float = 0.0,
+    tumor_fill_holes: bool = True,
+    tumor_keep_largest_component: bool = True,
+    tumor_min_component_voxels: int = 0,
+    tumor_dilation_radius_mm: float = 0.0,
+    crop_z_to_lung_bbox: bool = True,
 ) -> dict[str, str]:
-    """Process one Rxx-xxx case with TotalSegmentator lungs and native tumour SEG."""
+    """Process one Rxx-xxx case with reusable TotalSegmentator lung masks."""
     case_id = output_case_id(case_dir.name)
     result = {"raw_case_id": case_dir.name, "case_id": case_id, "status": "ok", "message": ""}
     if ((processed_root / case_id).exists() or (nifti_root / case_id).exists()) and not overwrite:
@@ -643,11 +874,17 @@ def process_radiogenomics_case(
         input_path, totalseg_dir = staging_root / case_id / "ct_hu_clipped.nii.gz", staging_root / case_id / "totalsegmentator"
     else:
         lung_mask, input_path, totalseg_dir = segment_lung_with_totalsegmentator(
-            hu_clipped, case_id, staging_root, executable=totalsegmentator_bin,
-            task=totalsegmentator_task, device=totalsegmentator_device, overwrite=overwrite,
+            hu_clipped, case_id, staging_root, task_id=totalsegmentator_task_id,
+            trainer=totalsegmentator_trainer,
+            resample_mm=totalsegmentator_resample_mm,
+            device=totalsegmentator_device,
+            # Output regeneration must not force an expensive new lung
+            # segmentation. If a persisted mask is absent, the helper still
+            # runs TotalSegmentator automatically.
+            overwrite=overwrite and not reuse_existing_lung_mask,
             lung_rois=totalsegmentator_lung_rois,
         )
-        lung_label = "TotalSegmentator:lung_lobes"
+        lung_label = f"TotalSegmentator:Task{totalsegmentator_task_id}:lung_lobes"
 
     try:
         seg_path = _find_seg(case_dir)
@@ -660,17 +897,40 @@ def process_radiogenomics_case(
             rtstruct_path, ct_image
         )
 
+    tumor_mask, tumor_cleanup = clean_tumor_mask(
+        tumor_mask,
+        closing_radius_mm=tumor_closing_radius_mm,
+        fill_holes=tumor_fill_holes,
+        keep_largest_component=tumor_keep_largest_component,
+        minimum_component_voxels=tumor_min_component_voxels,
+        dilation_radius_mm=tumor_dilation_radius_mm,
+    )
+
     lung_mask, removed_lung_components = remove_small_lung_components(lung_mask, LUNG_MIN_COMPONENT_VOXELS)
-    region = lung_crop_region(lung_mask, margin_mm=margin_mm)
-    image_final = crop_and_resize(_normalize_ct_image(ct_image, hu_window_low, hu_window_high), region, is_label=False)
-    mask_final = crop_and_resize(tumor_mask, region, is_label=True)
+    region = lung_crop_region(
+        lung_mask, margin_mm=margin_mm, crop_z_to_lung_bbox=crop_z_to_lung_bbox
+    )
+    image_final = crop_and_resize(
+        _normalize_ct_image(ct_image, hu_window_low, hu_window_high),
+        region,
+        is_label=False,
+        output_z_spacing_mm=output_z_spacing_mm,
+    )
+    mask_final = crop_and_resize(
+        tumor_mask,
+        region,
+        is_label=True,
+        output_z_spacing_mm=output_z_spacing_mm,
+    )
     result.update(
         ct_slices=str(len(ct_paths)), lung_source="TotalSegmentator", lung_labels=lung_label,
         tumor_source="DICOM SEG/RTSTRUCT", tumor_labels=";".join(selected_tumor_labels),
-        crop_index=str(region[0]), crop_size=str(region[1]), final_size=str(image_final.GetSize()),
+        crop_index=str(region[0]), crop_size=str(region[1]),
+        crop_z_to_lung_bbox=str(crop_z_to_lung_bbox), final_size=str(image_final.GetSize()),
         final_spacing=str(image_final.GetSpacing()),
     )
     result.update(totalsegmentator_input=str(input_path), totalsegmentator_output=str(totalseg_dir))
+    result.update({key: str(value) for key, value in tumor_cleanup.items()})
     if not dry_run:
         write_case_outputs(processed_root, nifti_root, case_id, image_final, mask_final, overwrite=overwrite)
     return result
@@ -683,3 +943,401 @@ def _write_report(rows: list[dict[str, str]], report_path: Path) -> None:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _same_image_geometry(first: sitk.Image, second: sitk.Image) -> bool:
+    """Return whether two images occupy the same voxel grid."""
+    return (
+        first.GetSize() == second.GetSize()
+        and np.allclose(first.GetSpacing(), second.GetSpacing())
+        and np.allclose(first.GetOrigin(), second.GetOrigin())
+        and np.allclose(first.GetDirection(), second.GetDirection())
+    )
+
+
+def resample_image_to_fixed_size(
+    image: sitk.Image,
+    target_size_xyz: tuple[int, int, int],
+    *,
+    is_label: bool,
+) -> sitk.Image:
+    """Resample an image while retaining its first/final voxel-centre extent."""
+    if any(size < 1 for size in target_size_xyz):
+        raise ValueError("all target dimensions must be positive")
+    source_size = image.GetSize()
+    source_spacing = image.GetSpacing()
+    target_spacing = tuple(
+        source_spacing[axis]
+        if source_size[axis] == 1 or target_size_xyz[axis] == 1
+        else source_spacing[axis]
+        * (source_size[axis] - 1)
+        / (target_size_xyz[axis] - 1)
+        for axis in range(3)
+    )
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetSize(target_size_xyz)
+    resampler.SetOutputSpacing(target_spacing)
+    resampler.SetOutputOrigin(image.GetOrigin())
+    resampler.SetOutputDirection(image.GetDirection())
+    resampler.SetTransform(sitk.Transform())
+    resampler.SetDefaultPixelValue(0)
+    resampler.SetInterpolator(sitk.sitkNearestNeighbor if is_label else sitk.sitkLinear)
+    return resampler.Execute(image)
+
+
+def write_3d_nifti_case(
+    processed_3d_root: Path,
+    case_id: str,
+    image: sitk.Image,
+    mask: sitk.Image,
+    *,
+    overwrite: bool = False,
+) -> None:
+    """Atomically write a paired 3D NIfTI case to ``processed-3d``."""
+    if not _same_image_geometry(image, mask):
+        raise ValueError("image and mask geometry must match")
+    destination = processed_3d_root / case_id
+    if destination.exists() and not overwrite:
+        raise FileExistsError(f"output already exists for {case_id}")
+
+    processed_3d_root.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    temporary = processed_3d_root / f".{case_id}.{token}.tmp"
+    backup = processed_3d_root / f".{case_id}.{token}.backup"
+    replaced = False
+    try:
+        temporary.mkdir()
+        sitk.WriteImage(image, str(temporary / "image.nii.gz"))
+        sitk.WriteImage(sitk.Cast(mask > 0, sitk.sitkUInt8), str(temporary / "mask.nii.gz"))
+        if destination.exists():
+            _replace_path_with_retry(destination, backup)
+        _replace_path_with_retry(temporary, destination)
+        replaced = True
+        shutil.rmtree(backup, ignore_errors=True)
+    except Exception:
+        if replaced:
+            shutil.rmtree(destination, ignore_errors=True)
+        if backup.exists():
+            backup.replace(destination)
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+
+
+def resize_nifti_case_to_3d(
+    source_case_dir: Path,
+    processed_3d_root: Path,
+    *,
+    target_size_xyz: tuple[int, int, int] = (256, 256, 128),
+    overwrite: bool = False,
+) -> dict[str, str]:
+    """Resize one paired NIfTI case to a fixed 3D grid.
+
+    The input grid geometry is preserved in the return value so an inference
+    mask can later be resampled back to the original NIfTI grid.  Image data
+    uses linear interpolation and binary labels use nearest-neighbour.
+    """
+    if any(size < 1 for size in target_size_xyz):
+        raise ValueError("all target dimensions must be positive")
+
+    case_id = source_case_dir.name
+    image_path = source_case_dir / "image.nii.gz"
+    mask_path = source_case_dir / "mask.nii.gz"
+    if not image_path.is_file() or not mask_path.is_file():
+        missing = [
+            path.name for path in (image_path, mask_path) if not path.is_file()
+        ]
+        raise FileNotFoundError(f"missing paired NIfTI file(s): {', '.join(missing)}")
+
+    destination = processed_3d_root / case_id
+    if destination.exists() and not overwrite:
+        return {
+            "case_id": case_id,
+            "status": "skipped",
+            "message": "output already exists",
+        }
+
+    image = sitk.ReadImage(str(image_path))
+    mask = sitk.ReadImage(str(mask_path))
+    if not _same_image_geometry(image, mask):
+        raise ValueError("image.nii.gz and mask.nii.gz do not share the same geometry")
+
+    source_size = image.GetSize()
+    source_spacing = image.GetSpacing()
+    image_3d = resample_image_to_fixed_size(
+        image, target_size_xyz, is_label=False
+    )
+    mask_3d = sitk.Cast(
+        resample_image_to_fixed_size(
+            sitk.Cast(mask > 0, sitk.sitkUInt8), target_size_xyz, is_label=True
+        )
+        > 0,
+        sitk.sitkUInt8,
+    )
+    write_3d_nifti_case(
+        processed_3d_root, case_id, image_3d, mask_3d, overwrite=overwrite
+    )
+
+    return {
+        "case_id": case_id,
+        "status": "ok",
+        "message": "",
+        # SimpleITK size/spacing are XYZ; arrays exposed to PyTorch are DHW.
+        "original_shape_dhw": str((source_size[2], source_size[1], source_size[0])),
+        "original_depth": str(source_size[2]),
+        "original_height": str(source_size[1]),
+        "original_width": str(source_size[0]),
+        "original_spacing_xyz_mm": str(source_spacing),
+        "original_spacing_zxy_mm": str(
+            (source_spacing[2], source_spacing[0], source_spacing[1])
+        ),
+        "original_origin_xyz_mm": str(image.GetOrigin()),
+        "original_direction": str(image.GetDirection()),
+        "processed_shape_dhw": str(
+            (target_size_xyz[2], target_size_xyz[1], target_size_xyz[0])
+        ),
+        "processed_spacing_xyz_mm": str(image_3d.GetSpacing()),
+    }
+
+
+def _three_d_geometry_report(
+    source_image: sitk.Image, resized_image: sitk.Image
+) -> dict[str, str]:
+    """Build restoration metadata for a volume represented as a DHW array."""
+    source_size = source_image.GetSize()
+    source_spacing = source_image.GetSpacing()
+    return {
+        "original_shape_dhw": str((source_size[2], source_size[1], source_size[0])),
+        "original_depth": str(source_size[2]),
+        "original_height": str(source_size[1]),
+        "original_width": str(source_size[0]),
+        "original_spacing_xyz_mm": str(source_spacing),
+        "original_spacing_zxy_mm": str(
+            (source_spacing[2], source_spacing[0], source_spacing[1])
+        ),
+        "original_origin_xyz_mm": str(source_image.GetOrigin()),
+        "original_direction": str(source_image.GetDirection()),
+        "processed_shape_dhw": str(
+            (
+                resized_image.GetSize()[2],
+                resized_image.GetSize()[1],
+                resized_image.GetSize()[0],
+            )
+        ),
+        "processed_spacing_xyz_mm": str(resized_image.GetSpacing()),
+    }
+
+
+def process_case_3d(
+    case_dir: Path,
+    processed_3d_root: Path,
+    margin_mm: float,
+    overwrite: bool,
+    *,
+    target_size_xyz: tuple[int, int, int] = (256, 256, 128),
+    dry_run: bool = False,
+    hu_window_low: int = HU_WINDOW_LOW,
+    hu_window_high: int = HU_WINDOW_HIGH,
+    crop_z_to_lung_bbox: bool = True,
+) -> dict[str, str]:
+    """Create a fixed-size 3D Radiomics case directly from raw DICOM."""
+    case_id = output_case_id(case_dir.name)
+    result = {
+        "raw_case_id": case_dir.name,
+        "case_id": case_id,
+        "status": "ok",
+        "message": "",
+    }
+    if (processed_3d_root / case_id).exists() and not overwrite:
+        result.update(status="skipped", message="output already exists")
+        return result
+
+    ct_image, ct_paths = _load_ct(case_dir)
+    try:
+        seg_path = _find_seg(case_dir)
+    except ValueError:
+        seg_path = None
+    if seg_path is not None:
+        try:
+            lung_mask, lung_labels = _decode_segments_to_ct(
+                seg_path, LUNG_SEGMENT_LABELS, ct_image
+            )
+        except ValueError:
+            lung_mask = derive_lung_mask_from_ct(ct_image)
+            lung_labels = ["CT-derived lung fallback"]
+    else:
+        lung_mask = derive_lung_mask_from_ct(ct_image)
+        lung_labels = ["CT-derived lung fallback"]
+    lung_mask, removed_lung_components = remove_small_lung_components(
+        lung_mask, LUNG_MIN_COMPONENT_VOXELS
+    )
+    if seg_path is not None:
+        try:
+            tumor_mask, tumor_labels = _decode_segments_to_ct(
+                seg_path, TUMOR_SEGMENT_LABELS, ct_image
+            )
+        except ValueError:
+            tumor_mask, tumor_labels = _decode_rtstruct_tumor_to_ct(
+                _find_rtstruct(case_dir), ct_image
+            )
+    else:
+        tumor_mask, tumor_labels = _decode_rtstruct_tumor_to_ct(
+            _find_rtstruct(case_dir), ct_image
+        )
+
+    region = lung_crop_region(
+        lung_mask, margin_mm=margin_mm, crop_z_to_lung_bbox=crop_z_to_lung_bbox
+    )
+    # This is the (z, 256, 256) grid retained in the CSV for restoration.
+    image_before_3d = crop_and_resize(
+        _normalize_ct_image(ct_image, hu_window_low, hu_window_high),
+        region,
+        is_label=False,
+    )
+    mask_before_3d = crop_and_resize(tumor_mask, region, is_label=True)
+    image_final = resample_image_to_fixed_size(
+        image_before_3d, target_size_xyz, is_label=False
+    )
+    mask_final = sitk.Cast(
+        resample_image_to_fixed_size(
+            sitk.Cast(mask_before_3d > 0, sitk.sitkUInt8),
+            target_size_xyz,
+            is_label=True,
+        )
+        > 0,
+        sitk.sitkUInt8,
+    )
+    result.update(
+        ct_slices=str(len(ct_paths)),
+        seg_path=str(seg_path or ""),
+        lung_labels=";".join(lung_labels),
+        removed_lung_components=str(removed_lung_components),
+        tumor_labels=";".join(tumor_labels),
+        crop_index=str(region[0]),
+        crop_size=str(region[1]),
+        crop_z_to_lung_bbox=str(crop_z_to_lung_bbox),
+    )
+    result.update(_three_d_geometry_report(image_before_3d, image_final))
+    if not dry_run:
+        write_3d_nifti_case(
+            processed_3d_root, case_id, image_final, mask_final, overwrite=overwrite
+        )
+    return result
+
+
+def process_radiogenomics_case_3d(
+    case_dir: Path,
+    processed_3d_root: Path,
+    staging_root: Path,
+    margin_mm: float,
+    overwrite: bool,
+    totalsegmentator_task_id: int,
+    totalsegmentator_device: str | None,
+    *,
+    target_size_xyz: tuple[int, int, int] = (256, 256, 128),
+    dry_run: bool = False,
+    hu_window_low: int = HU_WINDOW_LOW,
+    hu_window_high: int = HU_WINDOW_HIGH,
+    totalsegmentator_lung_rois: Sequence[str] | None = None,
+    totalsegmentator_trainer: str = "nnUNetTrainerNoMirroring",
+    totalsegmentator_resample_mm: float = 1.5,
+    reuse_existing_lung_mask: bool = True,
+    tumor_closing_radius_mm: float = 0.0,
+    tumor_fill_holes: bool = True,
+    tumor_keep_largest_component: bool = True,
+    tumor_min_component_voxels: int = 0,
+    tumor_dilation_radius_mm: float = 0.0,
+    crop_z_to_lung_bbox: bool = True,
+) -> dict[str, str]:
+    """Create a fixed-size 3D Radiogenomics case directly from raw DICOM."""
+    case_id = output_case_id(case_dir.name)
+    result = {
+        "raw_case_id": case_dir.name,
+        "case_id": case_id,
+        "status": "ok",
+        "message": "",
+    }
+    if (processed_3d_root / case_id).exists() and not overwrite:
+        result.update(status="skipped", message="output already exists")
+        return result
+
+    ct_image, ct_paths = _load_ct(case_dir)
+    hu_clipped = clip_hu_image(ct_image, hu_window_low, hu_window_high)
+    if dry_run:
+        lung_mask = derive_lung_mask_from_ct(ct_image)
+        lung_label = "CT-derived lung fallback (dry run)"
+        input_path = staging_root / case_id / "ct_hu_clipped.nii.gz"
+        totalseg_dir = staging_root / case_id / "totalsegmentator"
+    else:
+        lung_mask, input_path, totalseg_dir = segment_lung_with_totalsegmentator(
+            hu_clipped,
+            case_id,
+            staging_root,
+            task_id=totalsegmentator_task_id,
+            trainer=totalsegmentator_trainer,
+            resample_mm=totalsegmentator_resample_mm,
+            device=totalsegmentator_device,
+            overwrite=overwrite and not reuse_existing_lung_mask,
+            lung_rois=totalsegmentator_lung_rois,
+        )
+        lung_label = f"TotalSegmentator:Task{totalsegmentator_task_id}:lung_lobes"
+    try:
+        seg_path = _find_seg(case_dir)
+        tumor_mask, tumor_labels = _decode_segments_to_ct(
+            seg_path, RADIOGENOMICS_TUMOR_SEGMENT_LABELS, ct_image
+        )
+    except ValueError:
+        tumor_mask, tumor_labels = _decode_rtstruct_tumor_to_ct(
+            _find_rtstruct(case_dir), ct_image
+        )
+    tumor_mask, tumor_cleanup = clean_tumor_mask(
+        tumor_mask,
+        closing_radius_mm=tumor_closing_radius_mm,
+        fill_holes=tumor_fill_holes,
+        keep_largest_component=tumor_keep_largest_component,
+        minimum_component_voxels=tumor_min_component_voxels,
+        dilation_radius_mm=tumor_dilation_radius_mm,
+    )
+    lung_mask, removed_lung_components = remove_small_lung_components(
+        lung_mask, LUNG_MIN_COMPONENT_VOXELS
+    )
+    region = lung_crop_region(
+        lung_mask, margin_mm=margin_mm, crop_z_to_lung_bbox=crop_z_to_lung_bbox
+    )
+    image_before_3d = crop_and_resize(
+        _normalize_ct_image(ct_image, hu_window_low, hu_window_high),
+        region,
+        is_label=False,
+    )
+    mask_before_3d = crop_and_resize(tumor_mask, region, is_label=True)
+    image_final = resample_image_to_fixed_size(
+        image_before_3d, target_size_xyz, is_label=False
+    )
+    mask_final = sitk.Cast(
+        resample_image_to_fixed_size(
+            sitk.Cast(mask_before_3d > 0, sitk.sitkUInt8),
+            target_size_xyz,
+            is_label=True,
+        )
+        > 0,
+        sitk.sitkUInt8,
+    )
+    result.update(
+        ct_slices=str(len(ct_paths)),
+        lung_source="TotalSegmentator",
+        lung_labels=lung_label,
+        tumor_source="DICOM SEG/RTSTRUCT",
+        tumor_labels=";".join(tumor_labels),
+        removed_lung_components=str(removed_lung_components),
+        crop_index=str(region[0]),
+        crop_size=str(region[1]),
+        crop_z_to_lung_bbox=str(crop_z_to_lung_bbox),
+        totalsegmentator_input=str(input_path),
+        totalsegmentator_output=str(totalseg_dir),
+    )
+    result.update({key: str(value) for key, value in tumor_cleanup.items()})
+    result.update(_three_d_geometry_report(image_before_3d, image_final))
+    if not dry_run:
+        write_3d_nifti_case(
+            processed_3d_root, case_id, image_final, mask_final, overwrite=overwrite
+        )
+    return result

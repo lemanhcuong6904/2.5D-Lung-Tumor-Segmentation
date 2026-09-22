@@ -3,7 +3,7 @@ import torch
 import numpy as np
 
 from models.transunet import TransUNet
-from trains.train_transunet import (
+from trains.train_nsclc_radiomics import (
     _summarize_predictions,
     build_weighted_bce_loss,
     restore_training_state,

@@ -30,11 +30,14 @@ from utils.metrics import binary_slice_metrics, binary_volume_metrics, finite_me
 
 
 CFG: dict[str, Any] = {
+    # Selects dataset-specific final lesion selection. Paths remain explicit
+    # below so a particular experiment/run can be evaluated safely.
+    "DATASET": "nsclc_radiomics",  # "nsclc_radiomics" or "nsclc_radiogenomics"
     # Directory containing <case_id>.nii.gz volumes produced by inference.
     "PREDICTIONS_DIR": str(
         ROOT_DIR
         / "output"
-        / "transunet_2d_micro_dice_loss_balanced_sampling"
+        / "transunet_2.5d-5_balanced_sampling"
         / "test"
         / "predictions"
     ),
@@ -44,7 +47,7 @@ CFG: dict[str, Any] = {
     "OUTPUT_DIR": str(
         ROOT_DIR
         / "output"
-        / "transunet_2d_micro_dice_loss_balanced_sampling"
+        / "transunet_2.5d-5_balanced_sampling"
         / "test"
         / "post_processed"
     ),
@@ -66,6 +69,12 @@ CFG: dict[str, Any] = {
     # dominant cluster. This is the binary-mask fallback for a high-confidence
     # secondary component; set to 1.0 to keep only the dominant cluster.
     "SECONDARY_CLUSTER_MIN_VOLUME_RATIO": 0.10,
+    # Radiogenomics only: after the standard post-processing above, retain one
+    # lesion using a weighted score across connected components. Scores are
+    # normalized within each volume before applying these weights.
+    "RADIOGENOMICS_VOLUME_WEIGHT": 0.20,
+    "RADIOGENOMICS_Z_THICKNESS_WEIGHT": 0.10,
+    "RADIOGENOMICS_SLICE_STABILITY_WEIGHT": 0.70,
 }
 
 # This is intentionally disabled by default.  It uses test-set ground truth to
@@ -90,6 +99,16 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _finite_std_iqr(values: list[float]) -> tuple[float, float]:
+    """Return sample standard deviation and IQR after excluding non-finite values."""
+    finite_values = np.asarray([value for value in values if np.isfinite(value)], dtype=np.float64)
+    if finite_values.size == 0:
+        return float("nan"), float("nan")
+    standard_deviation = float(finite_values.std(ddof=1)) if finite_values.size > 1 else 0.0
+    interquartile_range = float(np.percentile(finite_values, 75) - np.percentile(finite_values, 25))
+    return standard_deviation, interquartile_range
 
 
 def ellipsoidal_structure(radius_mm: float, spacing_xyz: tuple[float, float, float]) -> np.ndarray:
@@ -491,6 +510,77 @@ def _component_clusters(
     return list(groups.values())
 
 
+def retain_weighted_stable_lesion(
+    mask_zyx: np.ndarray,
+    connectivity: int,
+    volume_weight: float,
+    z_thickness_weight: float,
+    slice_stability_weight: float,
+) -> tuple[np.ndarray, dict[str, int | float]]:
+    """Keep one component using normalized volume, Z extent, and slice stability.
+
+    Stability is the mean IoU of masks in consecutive occupied Z slices.  It
+    rewards a lesion whose contour changes smoothly through the volume, while
+    component volume and Z extent prevent a tiny but coincidentally smooth
+    fragment from winning.  This method never uses ground truth.
+    """
+    weights = np.asarray(
+        (volume_weight, z_thickness_weight, slice_stability_weight), dtype=float
+    )
+    if np.any(weights < 0) or not np.any(weights > 0):
+        raise ValueError("Radiogenomics lesion-selection weights must be non-negative and not all zero")
+    weights /= weights.sum()
+    labels, component_count = ndimage.label(
+        np.asarray(mask_zyx, dtype=bool), structure=_connectivity_structure(connectivity)
+    )
+    if component_count == 0:
+        return np.zeros_like(mask_zyx, dtype=bool), {
+            "radiogenomics_components_before_selection": 0,
+            "radiogenomics_components_removed": 0,
+        }
+
+    candidates: list[dict[str, float | int]] = []
+    for label in range(1, component_count + 1):
+        component = labels == label
+        z_indices = np.flatnonzero(component.any(axis=(1, 2)))
+        slice_masks = component[z_indices]
+        if len(slice_masks) < 2:
+            stability = 0.0
+        else:
+            overlaps = np.logical_and(slice_masks[:-1], slice_masks[1:]).sum(axis=(1, 2))
+            unions = np.logical_or(slice_masks[:-1], slice_masks[1:]).sum(axis=(1, 2))
+            stability = float(np.mean(np.divide(overlaps, unions, out=np.zeros_like(overlaps, dtype=float), where=unions > 0)))
+        candidates.append({
+            "label": label,
+            "voxels": int(component.sum()),
+            "z_span": int(z_indices[-1] - z_indices[0] + 1),
+            "stability": stability,
+        })
+
+    maxima = np.asarray([
+        max(float(candidate[key]) for candidate in candidates)
+        for key in ("voxels", "z_span", "stability")
+    ])
+    for candidate in candidates:
+        normalized = np.divide(
+            np.asarray([candidate["voxels"], candidate["z_span"], candidate["stability"]], dtype=float),
+            maxima,
+            out=np.zeros(3, dtype=float),
+            where=maxima > 0,
+        )
+        candidate["score"] = float(np.dot(weights, normalized))
+    selected = max(candidates, key=lambda item: (float(item["score"]), float(item["stability"]), int(item["voxels"])))
+    result = labels == int(selected["label"])
+    return result, {
+        "radiogenomics_components_before_selection": int(component_count),
+        "radiogenomics_components_removed": int(component_count - 1),
+        "radiogenomics_selected_component_voxels": int(selected["voxels"]),
+        "radiogenomics_selected_component_z_span_slices": int(selected["z_span"]),
+        "radiogenomics_selected_component_stability": float(selected["stability"]),
+        "radiogenomics_selected_component_score": float(selected["score"]),
+    }
+
+
 def postprocess_volume(
     prediction_zyx: np.ndarray,
     spacing_xyz: tuple[float, float, float],
@@ -681,6 +771,9 @@ def run_postprocessing(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[
     """Post-process every saved prediction and write masks plus metric reports."""
     predictions_dir = Path(cfg["PREDICTIONS_DIR"])
     nifti_root, output_dir = Path(cfg["NIFTI_ROOT"]), Path(cfg["OUTPUT_DIR"])
+    dataset = str(cfg.get("DATASET", "")).casefold()
+    if dataset not in {"nsclc_radiomics", "nsclc_radiogenomics"}:
+        raise ValueError("DATASET must be 'nsclc_radiomics' or 'nsclc_radiogenomics'")
     prediction_paths = sorted(predictions_dir.glob("*.nii.gz"))
     if not prediction_paths:
         raise FileNotFoundError(f"no .nii.gz predictions found in {predictions_dir}")
@@ -704,6 +797,15 @@ def run_postprocessing(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[
             float(cfg["MIN_COMPONENT_VOLUME_MM3"]), int(cfg["CONNECTIVITY"]),
             float(cfg["COMPONENT_LINK_DISTANCE_MM"]), float(cfg["SECONDARY_CLUSTER_MIN_VOLUME_RATIO"]),
         )
+        if dataset == "nsclc_radiogenomics":
+            cleaned, lesion_selection = retain_weighted_stable_lesion(
+                cleaned,
+                int(cfg["CONNECTIVITY"]),
+                float(cfg["RADIOGENOMICS_VOLUME_WEIGHT"]),
+                float(cfg["RADIOGENOMICS_Z_THICKNESS_WEIGHT"]),
+                float(cfg["RADIOGENOMICS_SLICE_STABILITY_WEIGHT"]),
+            )
+            components |= lesion_selection
         postprocess_seconds = time.perf_counter() - postprocess_start
         metrics = binary_volume_metrics(cleaned, target, spacing_xyz)
         _write_volume(output_dir / "predictions" / prediction_path.name, cleaned, target_image)
@@ -748,10 +850,17 @@ def run_postprocessing(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[
     for key in ("dice", "iou", "recall", "precision", "hd95", "assd"):
         values = [float(row[key]) for row in case_rows]
         summary[f"{key}_3d"] = finite_mean(values)
+        standard_deviation, interquartile_range = _finite_std_iqr(values)
+        summary[f"{key}_3d_std"] = standard_deviation
+        summary[f"{key}_3d_iqr"] = interquartile_range
         if key in {"hd95", "assd"}:
             summary[f"{key}_valid_cases"] = int(sum(np.isfinite(values)))
     for key in ("dice", "iou", "recall", "precision"):
-        summary[f"{key}_2d"] = finite_mean([float(row[key]) for row in slice_rows])
+        values = [float(row[key]) for row in slice_rows]
+        summary[f"{key}_2d"] = finite_mean(values)
+        standard_deviation, interquartile_range = _finite_std_iqr(values)
+        summary[f"{key}_2d_std"] = standard_deviation
+        summary[f"{key}_2d_iqr"] = interquartile_range
     summary.update({
         "fp_2d": sum(int(row["slice_fp"]) for row in slice_rows),
         "fn_2d": sum(int(row["slice_fn"]) for row in slice_rows),
@@ -766,7 +875,14 @@ def run_postprocessing(cfg: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[
         "connectivity": int(cfg["CONNECTIVITY"]),
         "component_link_distance_mm": float(cfg["COMPONENT_LINK_DISTANCE_MM"]),
         "secondary_cluster_min_volume_ratio": float(cfg["SECONDARY_CLUSTER_MIN_VOLUME_RATIO"]),
+        "dataset": dataset,
     })
+    if dataset == "nsclc_radiogenomics":
+        summary.update({
+            "radiogenomics_volume_weight": float(cfg["RADIOGENOMICS_VOLUME_WEIGHT"]),
+            "radiogenomics_z_thickness_weight": float(cfg["RADIOGENOMICS_Z_THICKNESS_WEIGHT"]),
+            "radiogenomics_slice_stability_weight": float(cfg["RADIOGENOMICS_SLICE_STABILITY_WEIGHT"]),
+        })
     postprocess_times = np.asarray([float(row["postprocess_seconds"]) for row in case_rows], dtype=np.float64)
     summary.update({
         "postprocess_total_seconds": float(postprocess_times.sum()),
